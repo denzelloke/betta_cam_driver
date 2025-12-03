@@ -1,0 +1,15 @@
+<launch>
+    <arg name="debug" default="false"/>
+    <arg name="launch_prefix_cmd" default="" unless="$(arg debug)" />
+    <arg name="launch_prefix_cmd" default="gdb -ex='set confirm off' -ex run --args" if="$(arg debug)" />
+
+    <group ns="ikan">
+        <node pkg="h264_camera_driver" name="front_cam_node" type="imx_477_node" output="screen" launch-prefix="$(arg launch_prefix_cmd)">
+            <param name="cam_port" value="3"/>
+            <param name="flip_image" value="false"/>
+            <param name="frame_id" value="front_cam"/>
+            <param name="topic_name" value="front_cam"/>
+            <param name="calibration_file_name" value="calibration_imx185.yaml"/>
+        </node>
+    </group>
+</launch>

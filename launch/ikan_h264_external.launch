@@ -1,0 +1,13 @@
+<launch>
+    <arg name="debug" default="false"/>
+    <arg name="launch_prefix_cmd" default="" unless="$(arg debug)" />
+    <arg name="launch_prefix_cmd" default="gdb -ex='set confirm off' -ex run --args" if="$(arg debug)" />
+
+    <node pkg="h264_camera_driver" name="ip_cam_node" type="external_h264_node" output="screen" launch-prefix="$(arg launch_prefix_cmd)">
+        <param name="source_ros_topic" value="/betta/ip_cam/raw_h264"/>
+        <param name="source_h264_config_topic" value="/betta/ip_cam/camera_config"/>
+        <param name="topic_name" value="/betta/ip_cam"/>
+        <param name="frame_id" value="ip_cam"/>
+        <param name="calibration_file_name" value="calibration_seaWater.yaml"/>
+    </node>
+</launch>

@@ -1,0 +1,3 @@
+<launch>
+    <include file="$(find h264_camera_driver)/launch/ikan_imx477.launch"/>
+</launch>

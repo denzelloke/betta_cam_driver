@@ -1,0 +1,12 @@
+<launch>
+    <arg name="debug" default="false"/>
+    <arg name="launch_prefix_cmd" default="" unless="$(arg debug)" />
+    <arg name="launch_prefix_cmd" default="gdb -ex='set confirm off' -ex run --args" if="$(arg debug)" />
+
+    <node pkg="h264_camera_driver" name="ip_cam_node" type="external_jpeg_node" output="screen" launch-prefix="$(arg launch_prefix_cmd)">
+        <param name="source_ros_topic" value="/ikan/ip_cam/image_color/compressed"/>
+        <param name="frame_id" value="ip_cam"/>
+        <param name="topic_name" value="/ikan/ip_cam"/>
+        <param name="calibration_file_name" value="calibration_imx185.yaml"/>
+    </node>
+</launch>

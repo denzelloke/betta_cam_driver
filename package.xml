@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<package format="3">
+    <name>h264_camera_driver</name>
+    <version>0.0.0</version>
+    <description>The h264_camera_driver package</description>
+
+    <maintainer email="ashiwinr@beex.sg">nvidia</maintainer>
+
+    <license>BeeX</license>
+
+    <build_depend>ros_environment</build_depend>
+
+    <buildtool_depend condition="$ROS_VERSION == 1">catkin</buildtool_depend>
+    <depend condition="$ROS_VERSION == 1">rospy</depend>
+    <depend condition="$ROS_VERSION == 1">message_runtime</depend>
+    <depend condition="$ROS_VERSION == 1">roscpp</depend>
+    <depend condition="$ROS_VERSION == 1">roslib</depend>
+    <depend condition="$ROS_VERSION == 1">cv_bridge</depend>
+
+    <buildtool_depend condition="$ROS_VERSION == 2">ament_cmake</buildtool_depend>
+    <buildtool_depend condition="$ROS_VERSION == 2">rosidl_default_generators</buildtool_depend>
+    <member_of_group condition="$ROS_VERSION == 2">rosidl_interface_packages</member_of_group>
+    <exec_depend condition="$ROS_VERSION == 2">rosidl_default_runtime</exec_depend>
+    <depend condition="$ROS_VERSION == 2">rclcpp</depend>
+    <depend condition="$ROS_VERSION == 2">rclpy</depend>
+
+    <depend>bx_msgs</depend>
+
+    <depend>std_msgs</depend>
+    <depend>sensor_msgs</depend>
+    <depend>geometry_msgs</depend>
+
+</package>
