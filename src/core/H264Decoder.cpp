@@ -1,5 +1,5 @@
+// Copyright by BeeX [2024]
 #include <h264_camera_driver/core/H264Decoder.h>
-
 
 #define TEST_ERROR(condition, message)                                                                                 \
     if (condition) {                                                                                                   \
@@ -20,7 +20,7 @@ bool H264Decoder::decoder_put_packet(const Msg_ImageH264Feed_ConstPtr &msg) {
     uint8_t *buffer_data   = const_cast<uint8_t *>(msg->data.data());
     const uint8_t nal_type = buffer_data[4] & 0x1F;
 
-    // FIX: Allow IDR (5), SPS (7), or PPS (8) to start the sequence
+    // Allow IDR (5), SPS (7), or PPS (8) to start the sequence
     const bool is_idr = (nal_type == 5);
     const bool is_sps = (nal_type == 7);
     const bool is_pps = (nal_type == 8);
@@ -30,9 +30,8 @@ bool H264Decoder::decoder_put_packet(const Msg_ImageH264Feed_ConstPtr &msg) {
             printf("Found keyframe/config (Type %d)! Starting decode...\n", nal_type);
             has_first_frame = true;
         } else {
-            // Drop P-frames (1) or others until we sync
             static int log_counter = 0;
-            if (log_counter++ % 30 == 0) {  // Limit log spam
+            if (log_counter++ % 30 == 0) {
                 printf("nal_type: %d Waiting for first I frame (IDR/SPS/PPS)...\n", nal_type);
             }
             return false;
@@ -75,7 +74,8 @@ bool H264Decoder::decoder_put_packet(const Msg_ImageH264Feed_ConstPtr &msg) {
     return true;
 }
 
-bool H264Decoder::decoder_get_frame(const int32_t out_dma_buf_2K) {
+// MIGRATION: Takes NvBufSurface* as destination
+bool H264Decoder::decoder_get_frame(NvBufSurface *out_dma_buf_2K) {
 
     std::unique_lock<std::mutex> lock(buffer_mutex);
     if (frame_pools.empty()) {
@@ -85,13 +85,41 @@ bool H264Decoder::decoder_get_frame(const int32_t out_dma_buf_2K) {
     const int picture_index = frame_pools.front();
     frame_pools.pop();
 
-    int32_t ret = NvBufferTransform(dmaBufferFileDescriptors[picture_index], out_dma_buf_2K, &transform_params);
-    TEST_ERROR(ret == -1, "Transform failed");
+    // Ensure index is valid within our surfaces bounds
+    if (picture_index >= (int)output_surfaces.size()) {
+        LOG_ERROR("Frame pool index out of bounds");
+        return false;
+    }
+
+    // MIGRATION: Use NvBufSurfTransform instead of NvBufferTransform
+    // Use the stored source surface from output_surfaces
+    int32_t ret = NvBufSurfTransform(output_surfaces[picture_index], out_dma_buf_2K, &transform_params);
+
+    // FIX: Return the buffer to the decoder NOW, after we are done reading/transforming it.
+    // This allows the decoder to reuse this buffer for future frames.
+    struct v4l2_buffer v4l2_buf;
+    struct v4l2_plane planes[MAX_PLANES];
+    memset(&v4l2_buf, 0, sizeof(v4l2_buf));
+    memset(planes, 0, sizeof(planes));
+
+    v4l2_buf.index            = picture_index;
+    v4l2_buf.m.planes         = planes;
+    v4l2_buf.type             = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    v4l2_buf.memory           = V4L2_MEMORY_DMABUF;
+    v4l2_buf.m.planes[0].m.fd = (int)output_surfaces[picture_index]->surfaceList[0].bufferDesc;
+
+    if (dec->capture_plane.qBuffer(v4l2_buf, NULL) < 0) {
+        LOG_ERROR("Error returning buffer to decoder in decoder_get_frame");
+    }
+
+    TEST_ERROR(ret != NvBufSurfTransformError_Success, "Transform failed");
 
     return true;
 }
 
 void H264Decoder::respondToResolutionEvent() {
+    // FIX: Lock the mutex to prevent race with decoder_get_frame
+    std::lock_guard<std::mutex> lock(buffer_mutex);
 
     struct v4l2_format v4l2Format;
     int32_t ret = dec->capture_plane.getFormat(v4l2Format);
@@ -106,11 +134,17 @@ void H264Decoder::respondToResolutionEvent() {
 
     dec->capture_plane.deinitPlane();
 
-    for (int32_t fd : dmaBufferFileDescriptors) {
-        ret = NvBufferDestroy(fd);
-        TEST_ERROR(ret < 0, "Failed to Destroy NvBuffer");
+    // FIX: Clear stale frames from the pool.
+    // Previous indices refer to destroyed surfaces or old session state.
+    while (!frame_pools.empty()) {
+        frame_pools.pop();
     }
-    dmaBufferFileDescriptors.clear();
+
+    // MIGRATION: Destroy existing surfaces
+    for (auto *surf : output_surfaces) {
+        NvBufSurfaceDestroy(surf);
+    }
+    output_surfaces.clear();
 
     ret = dec->setCapturePlaneFormat(
             v4l2Format.fmt.pix_mp.pixelformat,
@@ -122,33 +156,27 @@ void H264Decoder::respondToResolutionEvent() {
     dec->getMinimumCapturePlaneBuffers(minimumDecoderCaptureBuffers);
     TEST_ERROR(ret < 0, "Error while getting value of minimum capture plane buffers");
 
-
-    // If Standard, Decoder colorspace ITU-R BT.601 with standard range luma (16-235)
-    // Otherwise, Decoder colorspace ITU-R BT.601 with extended range luma (0-255)
-    NvBufferCreateParams cParams = {0};
-    cParams.width                = coded_width;
-    cParams.height               = coded_height;
-    cParams.layout               = NvBufferLayout_BlockLinear;
-    cParams.payloadType          = NvBufferPayload_SurfArray;
-    cParams.nvbuf_tag            = NvBufferTag_VIDEO_DEC;
+    // MIGRATION: Map V4L2 format to NvBufSurfaceColorFormat
+    NvBufSurfaceAllocateParams allocParams = {0};
+    allocParams.params.width               = coded_width;
+    allocParams.params.height              = coded_height;
+    allocParams.params.layout              = NVBUF_LAYOUT_BLOCK_LINEAR;
+    allocParams.params.memType             = NVBUF_MEM_SURFACE_ARRAY;
+    allocParams.memtag                     = NvBufSurfaceTag_VIDEO_DEC;  // Use VIDEO_DEC tag if possible, else NONE
 
     const bool isQuantDefault = (v4l2Format.fmt.pix_mp.quantization == V4L2_QUANTIZATION_DEFAULT);
     switch (v4l2Format.fmt.pix_mp.colorspace) {
     case V4L2_COLORSPACE_SMPTE170M:
-        cParams.colorFormat = isQuantDefault ? NvBufferColorFormat_NV12 : NvBufferColorFormat_NV12_ER;
+        allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12 : NVBUF_COLOR_FORMAT_NV12_ER;
         break;
-
     case V4L2_COLORSPACE_REC709:
-        cParams.colorFormat = isQuantDefault ? NvBufferColorFormat_NV12_709 : NvBufferColorFormat_NV12_709_ER;
+        allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12_709 : NVBUF_COLOR_FORMAT_NV12_709_ER;
         break;
-
     case V4L2_COLORSPACE_BT2020:
-        //"Decoder colorspace ITU-R BT.2020";
-        cParams.colorFormat = NvBufferColorFormat_NV12_2020;
+        allocParams.params.colorFormat = NVBUF_COLOR_FORMAT_NV12_2020;
         break;
-
     default:
-        cParams.colorFormat = isQuantDefault ? NvBufferColorFormat_NV12 : NvBufferColorFormat_NV12_ER;
+        allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12 : NVBUF_COLOR_FORMAT_NV12_ER;
         break;
     }
 
@@ -161,11 +189,12 @@ void H264Decoder::respondToResolutionEvent() {
 
     for (uint32_t idx = 0; idx < dec->capture_plane.getNumBuffers(); idx++) {
 
-        int32_t new_fd = 0;
-        ret            = NvBufferCreateEx(&new_fd, &cParams);
+        // MIGRATION: Allocate NvBufSurface
+        NvBufSurface *new_surf = nullptr;
+        ret                    = NvBufSurfaceAllocate(&new_surf, 1, &allocParams);
         TEST_ERROR(ret < 0, "Failed to create buffers");
-        dmaBufferFileDescriptors.push_back(new_fd);
 
+        output_surfaces.push_back(new_surf);
 
         struct v4l2_buffer v4l2_buf;
         struct v4l2_plane planes[MAX_PLANES];
@@ -173,29 +202,39 @@ void H264Decoder::respondToResolutionEvent() {
         memset(&v4l2_buf, 0, sizeof(v4l2_buf));
         memset(planes, 0, sizeof(planes));
 
-        v4l2_buf.index            = idx;
-        v4l2_buf.m.planes         = planes;
-        v4l2_buf.type             = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        v4l2_buf.memory           = V4L2_MEMORY_DMABUF;
-        v4l2_buf.m.planes[0].m.fd = dmaBufferFileDescriptors[idx];
+        v4l2_buf.index    = idx;
+        v4l2_buf.m.planes = planes;
+        v4l2_buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        v4l2_buf.memory   = V4L2_MEMORY_DMABUF;
+
+        // MIGRATION: Get FD from surface params
+        if (new_surf) {
+            v4l2_buf.m.planes[0].m.fd = (int)new_surf->surfaceList[0].bufferDesc;
+        }
 
         ret = dec->capture_plane.qBuffer(v4l2_buf, NULL);
         TEST_ERROR(ret < 0, "Error Qing buffer at output plane");
     }
 
-    // Update the transform parameters
+    // MIGRATION: Update the transform parameters
     memset(&transform_params, 0, sizeof(transform_params));
-    transform_params.transform_flag   = NVBUFFER_TRANSFORM_FILTER;
-    transform_params.transform_flip   = NvBufferTransform_None;
-    transform_params.transform_filter = NvBufferTransform_Filter_Smart;
-    transform_params.src_rect.top     = 0;
-    transform_params.src_rect.left    = 0;
-    transform_params.src_rect.width   = coded_width;
-    transform_params.src_rect.height  = coded_height;
-    transform_params.dst_rect.top     = 0;
-    transform_params.dst_rect.left    = 0;
-    transform_params.dst_rect.width   = coded_width;
-    transform_params.dst_rect.height  = coded_height;
+
+    // Store rects in class members to ensure pointers remain valid
+    src_rect.top    = 0;
+    src_rect.left   = 0;
+    src_rect.width  = coded_width;
+    src_rect.height = coded_height;
+
+    dst_rect.top    = 0;
+    dst_rect.left   = 0;
+    dst_rect.width  = coded_width;
+    dst_rect.height = coded_height;
+
+    transform_params.transform_flag   = NVBUFSURF_TRANSFORM_FILTER;
+    transform_params.transform_flip   = NvBufSurfTransform_None;
+    transform_params.transform_filter = NvBufSurfTransformInter_Algo3;  // Smart
+    transform_params.src_rect         = &src_rect;
+    transform_params.dst_rect         = &dst_rect;
 }
 
 void H264Decoder::dec_capture_loop_fcn() {
@@ -207,6 +246,7 @@ void H264Decoder::dec_capture_loop_fcn() {
     bool got_res_event = false;
     while (!eos && !(dec->isInError())) {
 
+        // Non-blocking event check if we already have resolution, otherwise blocking (500ms)
         int32_t ret = dec->dqEvent(v4l2Event, got_res_event ? 0 : 500);
         if (ret == 0 && v4l2Event.type == V4L2_EVENT_RESOLUTION_CHANGE) {
             respondToResolutionEvent();
@@ -217,35 +257,48 @@ void H264Decoder::dec_capture_loop_fcn() {
             continue;
         }
 
-        while (!eos) {
-            rate_limiter.sleep();
+        // FIX: Replaced inner loop with single pass to allow checking for events repeatedly
+        // This ensures subsequent resolution changes or other events are not starved.
 
-            struct v4l2_buffer v4l2_buf;
-            struct v4l2_plane planes[MAX_PLANES];
-            v4l2_buf.m.planes = planes;
+        struct v4l2_buffer v4l2_buf;
+        struct v4l2_plane planes[MAX_PLANES];
+        v4l2_buf.m.planes = planes;
 
-            if (dec->capture_plane.dqBuffer(v4l2_buf, &dec_buffer, NULL, 10) != 0) {
-                printf("DQBuffer failed\n");
-                usleep(10'000);
-                // break;
-                continue;
-            }
+        // Poll for frame (10ms timeout)
+        if (dec->capture_plane.dqBuffer(v4l2_buf, &dec_buffer, NULL, 10) == 0) {
 
-            dec_buffer->planes[0].fd = dmaBufferFileDescriptors[v4l2_buf.index];
+            std::unique_lock<std::mutex> lock(buffer_mutex);
 
-            {
-                std::unique_lock<std::mutex> lock(buffer_mutex);
-                frame_pools.push(v4l2_buf.index);
-                while (frame_pools.size() >= 5) {
-                    frame_pools.pop();
+            // FIX: If the queue is full, we must drop the oldest frame AND return it to the decoder
+            while (frame_pools.size() >= 5) {
+                int dropped_idx = frame_pools.front();
+                frame_pools.pop();
+
+                // Return dropped buffer to decoder so it can keep working
+                struct v4l2_buffer v4l2_buf_drop;
+                struct v4l2_plane planes_drop[MAX_PLANES];
+                memset(&v4l2_buf_drop, 0, sizeof(v4l2_buf_drop));
+                memset(planes_drop, 0, sizeof(planes_drop));
+
+                v4l2_buf_drop.index    = dropped_idx;
+                v4l2_buf_drop.m.planes = planes_drop;
+                v4l2_buf_drop.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                v4l2_buf_drop.memory   = V4L2_MEMORY_DMABUF;
+
+                // Ensure the surface still exists (might have been cleared by resolution event logic)
+                if (dropped_idx < (int)output_surfaces.size() && output_surfaces[dropped_idx]) {
+                    v4l2_buf_drop.m.planes[0].m.fd = (int)output_surfaces[dropped_idx]->surfaceList[0].bufferDesc;
+                    dec->capture_plane.qBuffer(v4l2_buf_drop, NULL);
                 }
             }
 
-            v4l2_buf.m.planes[0].m.fd = dmaBufferFileDescriptors[v4l2_buf.index];
+            frame_pools.push(v4l2_buf.index);
 
-            if (dec->capture_plane.qBuffer(v4l2_buf, NULL) != 0) {
-                ERROR_MSG("Error while queueing buffer at decoder capture plane");
-            }
+            // FIX: DO NOT qBuffer the current frame here immediately.
+            // We hold it until the consumer (decoder_get_frame) finishes with it.
+        } else {
+            // No frame ready, sleep briefly to avoid spinlock
+            rate_limiter.sleep();
         }
     }
 }
@@ -277,11 +330,11 @@ void H264Decoder::nvmpi_create_decoder() {
         frame_pools.pop();
     }
 
-    for (int32_t fd : dmaBufferFileDescriptors) {
-        ret = NvBufferDestroy(fd);
-        TEST_ERROR(ret < 0, "Failed to Destroy NvBuffer");
+    // MIGRATION: Cleanup surfaces
+    for (auto *surf : output_surfaces) {
+        NvBufSurfaceDestroy(surf);
     }
-    dmaBufferFileDescriptors.clear();
+    output_surfaces.clear();
 
     if (dec_capture_loop == nullptr) {
         dec_capture_loop = new std::thread(&H264Decoder::dec_capture_loop_fcn, this);
@@ -303,11 +356,11 @@ void H264Decoder::nvmpi_decoder_close() {
         dec_capture_loop = nullptr;
     }
 
-    for (int32_t fd : dmaBufferFileDescriptors) {
-        int32_t ret = NvBufferDestroy(fd);
-        TEST_ERROR(ret < 0, "Failed to Destroy NvBuffer");
+    // MIGRATION: Cleanup surfaces
+    for (auto *surf : output_surfaces) {
+        NvBufSurfaceDestroy(surf);
     }
-    dmaBufferFileDescriptors.clear();
+    output_surfaces.clear();
 
     delete dec;
     dec = nullptr;

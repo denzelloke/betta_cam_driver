@@ -3,10 +3,10 @@
 
 
 /*@brief: Jetson camera API design -> Objects do not have methods.
- *  All methods are provided by Interfaces.
- *  Driver runs 1 camera based on the port given, compresses the image
- *  using encodeFromFD which is hardware accelerated and finally publish the image
- *  reference: http://on-demand.gputechconf.com/gtc/2016/webinar/getting-started-jetpack-camera-api.pdf
+ * All methods are provided by Interfaces.
+ * Driver runs 1 camera based on the port given, compresses the image
+ * using encodeFromFD which is hardware accelerated and finally publish the image
+ * reference: http://on-demand.gputechconf.com/gtc/2016/webinar/getting-started-jetpack-camera-api.pdf
  */
 CameraFeedWrapper::CameraFeedWrapper(
         const std::string frame_id,
@@ -60,8 +60,8 @@ CameraFeedWrapper::CameraFeedWrapper(
 /* @brief: Destructor, cleanS up buffer, thread and all sessions before exiting program */
 CameraFeedWrapper::~CameraFeedWrapper() {
 
-    NvBufferDestroy(dma_buf_2K);
-    NvBufferDestroy(dma_buf_HD);
+    NvBufSurfaceDestroy(dma_buf_2K);
+    NvBufSurfaceDestroy(dma_buf_HD);
 
     pub_clahe_2k_h264.shutdown();
     pub_raw_hd_h264.shutdown();
@@ -80,7 +80,8 @@ bool CameraFeedWrapper::publishH264Feed(
 
     std::lock_guard<std::mutex> lock(feed_mutex);
 
-    iNativeBuffer->copyToNvBuffer(dma_buf_2K);
+    // Use the FD from bufferDesc to copy
+    iNativeBuffer->copyToNvBuffer((int)dma_buf_2K->surfaceList[0].bufferDesc);
 
     return spinH264FeedOnce(res_ptr);
 }
@@ -159,6 +160,7 @@ std::string CameraFeedWrapper::isExistsCalibration(std::string &calibration_file
 
 bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
 
+    ROS_INFO("spinH264FeedOnce");
     std::lock_guard<std::recursive_mutex> lock(calibration_mutex);
     if (rectifyImageYUVPtr) {
         ROS_TIME feed_timestamp;
@@ -201,7 +203,9 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
     // Publish the Raw HD H264 feed
     resizeFrame(dma_buf_2K, dma_buf_HD, IMAGE_WIDTH_2K, IMAGE_HEIGHT_2K, IMAGE_WIDTH_720, IMAGE_HEIGHT_720);
     if (h264_raw_hd_encoder->encodeFrame(h264_msg, dma_buf_HD)) {
-        PUBLISH_ROS(pub_raw_hd_h264, h264_msg);
+        if (!h264_msg.data.empty()) {
+            PUBLISH_ROS(pub_raw_hd_h264, h264_msg);
+        }
         SET_NODE_STATUS_OK();
 
     } else {
@@ -217,12 +221,14 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
     // Handles the JPEG encoding for the CLAHE feed
     if (res_ptr != nullptr) {
         NvBuffer2Jpeg(dma_buf_2K, res_ptr->processed_image_data);
-    }   
+    }
 
     // Publish the CLAHE HD H264 feed
     resizeFrame(dma_buf_2K, dma_buf_HD, IMAGE_WIDTH_2K, IMAGE_HEIGHT_2K, IMAGE_WIDTH_720, IMAGE_HEIGHT_720);
     if (h264_clahe_hd_encoder->encodeFrame(h264_msg, dma_buf_HD)) {
-        PUBLISH_ROS(pub_clahe_hd_h264, h264_msg);
+        if (!h264_msg.data.empty()) {
+            PUBLISH_ROS(pub_clahe_hd_h264, h264_msg);
+        }
         SET_NODE_STATUS_OK();
     } else {
         ROS_ERROR("H264 encoding failed for CLAHE HD frame - No Encoder");
@@ -232,7 +238,9 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
     // Publish the CLAHE 2K H264 feed
     if (is_even_frame) {
         if (h264_clahe_2k_encoder->encodeFrame(h264_msg, dma_buf_2K)) {
-            PUBLISH_ROS(pub_clahe_2k_h264, h264_msg);
+            if (!h264_msg.data.empty()) {
+                PUBLISH_ROS(pub_clahe_2k_h264, h264_msg);
+            }
             SET_NODE_STATUS_OK();
         } else {
             ROS_ERROR("H264 encoding failed for CLAHE 2K frame - No Encoder");
@@ -259,25 +267,32 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
 // Initialisation functions
 // -----------------------------------------------------
 
-int32_t CameraFeedWrapper::initialiseDmaBuffer(const int32_t img_width, const int32_t img_height) {
+NvBufSurface *CameraFeedWrapper::initialiseDmaBuffer(const int32_t img_width, const int32_t img_height) {
 
-    // Create a DMA buffer
-    NvBufferCreateParams params;
-    memset(&params, 0, sizeof(params));
-    params.width       = img_width;
-    params.height      = img_height;
-    params.layout      = NvBufferLayout_Pitch;
-    params.colorFormat = NvBufferColorFormat_YUV420;
-    params.payloadType = NvBufferPayload_SurfArray;
-    params.nvbuf_tag   = NvBufferTag_NONE;
+    NvBufSurfaceAllocateParams input_params = {0};
+    input_params.params.width               = img_width;
+    input_params.params.height              = img_height;
+    input_params.params.layout              = NVBUF_LAYOUT_PITCH;
+    input_params.params.colorFormat         = NVBUF_COLOR_FORMAT_YUV420;
+    input_params.params.memType             = NVBUF_MEM_SURFACE_ARRAY;
 
-    int32_t dmabuf_fd = -1;
-    if (NvBufferCreateEx(&dmabuf_fd, &params) != 0) {
-        NvBufferDestroy(dmabuf_fd);
-        raiseFatal("Failed to create DMA buffer of size: %dx%d!", img_width, img_height);
+    NvBufSurface *new_surf = nullptr;
+    if (NvBufSurfaceAllocate(&new_surf, 1, &input_params) != 0) {
+        raiseFatal("Failed to create NvBufSurface of size: %dx%d!", img_width, img_height);
     }
 
-    return dmabuf_fd;
+    // Explicitly zero out the buffer
+    // FIX: Map ALL planes (-1) instead of just plane 0
+    if (NvBufSurfaceMap(new_surf, 0, -1, NVBUF_MAP_READ_WRITE) == 0) {
+        NvBufSurfaceSyncForCpu(new_surf, 0, -1);  // Sync all planes
+        for (uint32_t i = 0; i < new_surf->surfaceList[0].planeParams.num_planes; i++) {
+            memset(new_surf->surfaceList[0].mappedAddr.addr[i], 0, new_surf->surfaceList[0].planeParams.psize[i]);
+        }
+        NvBufSurfaceSyncForDevice(new_surf, 0, -1);  // Sync all planes
+        NvBufSurfaceUnMap(new_surf, 0, -1);          // Unmap all planes
+    }
+
+    return new_surf;
 }
 
 
@@ -315,34 +330,24 @@ void CameraFeedWrapper::initialiseRosBindings(const std::string &frame_id, const
 // NvBuffer Helper functions
 // -----------------------------------------------------
 
-bool CameraFeedWrapper::nvBuffer2CvMat(cv::Mat &out_yuv_image, const int32_t src_dmabuf_fd) {
+bool CameraFeedWrapper::nvBuffer2CvMat(cv::Mat &out_yuv_image, NvBufSurface *src_surf) {
 
-    // 1. Validate fd
-    if (src_dmabuf_fd < 0) {
-        LOG_INFO("Invalid DMA buffer fd: %d", src_dmabuf_fd);
+    if (!src_surf) {
+        LOG_INFO("Invalid NvBufSurface");
         return false;
     }
 
-    // 2. Get NvBufSurface from fd (NEW API - this is the key difference!)
-    NvBufSurface *nvbuf_surf = nullptr;
-    int ret                  = NvBufSurfaceFromFd(src_dmabuf_fd, (void **)(&nvbuf_surf));
-    if (ret != 0 || nvbuf_surf == nullptr) {
-        LOG_INFO("Failed to get NvBufSurface from fd %d", src_dmabuf_fd);
-        return false;
-    }
-
-    // 3. Get dimensions from surface
-    const int32_t img_w                        = nvbuf_surf->surfaceList[0].width;
-    const int32_t img_h                        = nvbuf_surf->surfaceList[0].height;
-    const uint32_t num_planes                  = nvbuf_surf->surfaceList[0].planeParams.num_planes;
-    const NvBufSurfaceColorFormat color_format = nvbuf_surf->surfaceList[0].colorFormat;
+    // 1. Get dimensions from surface
+    const int32_t img_w       = src_surf->surfaceList[0].width;
+    const int32_t img_h       = src_surf->surfaceList[0].height;
+    const uint32_t num_planes = src_surf->surfaceList[0].planeParams.num_planes;
 
     if (img_w == 0 || img_h == 0) {
         LOG_INFO("Invalid buffer dimensions: %dx%d", img_w, img_h);
         return false;
     }
 
-    // 4. Create/resize output Mat for YUV (height * 1.5)
+    // 2. Create/resize output Mat for YUV (height * 1.5)
     const int32_t mat_height = (img_h * 3) / 2;
     if (out_yuv_image.empty() || out_yuv_image.rows != mat_height || out_yuv_image.cols != img_w) {
         out_yuv_image.create(mat_height, img_w, CV_8UC1);
@@ -351,227 +356,164 @@ bool CameraFeedWrapper::nvBuffer2CvMat(cv::Mat &out_yuv_image, const int32_t src
     uint8_t *yuv_data = out_yuv_image.data;
     size_t offset     = 0;
 
+    // 3. Map buffer
+    if (NvBufSurfaceMap(src_surf, 0, -1, NVBUF_MAP_READ) != 0) {
+        LOG_INFO("Failed to map surface");
+        return false;
+    }
+
+    // 4. Sync for CPU access
+    NvBufSurfaceSyncForCpu(src_surf, 0, -1);
+
     // 5. Handle based on format (NV12 = 2 planes, YUV420 = 3 planes)
     if (num_planes == 2) {
         // NV12 format: Y plane + interleaved UV plane
 
         // Copy Y plane (plane 0)
-        ret = NvBufSurfaceMap(nvbuf_surf, 0, 0, NVBUF_MAP_READ);
-        if (ret != 0) {
-            LOG_INFO("Failed to map Y plane");
-            return false;
-        }
-        NvBufSurfaceSyncForCpu(nvbuf_surf, 0, 0);  // IMPORTANT: sync before CPU access!
-
-        const uint32_t y_pitch = nvbuf_surf->surfaceList[0].planeParams.pitch[0];
-        uint8_t *y_src         = (uint8_t *)nvbuf_surf->surfaceList[0].mappedAddr.addr[0];
-
-        if (y_src == nullptr) {
-            LOG_INFO("Y plane mapped address is null");
-            NvBufSurfaceUnMap(nvbuf_surf, 0, 0);
-            return false;
-        }
+        const uint32_t y_pitch = src_surf->surfaceList[0].planeParams.pitch[0];
+        uint8_t *y_src         = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[0];
 
         for (int32_t row = 0; row < img_h; row++) {
             memcpy(yuv_data + offset, y_src + row * y_pitch, img_w);
             offset += img_w;
         }
-        NvBufSurfaceUnMap(nvbuf_surf, 0, 0);
 
-        // Copy UV plane (plane 1) - interleaved, half height
-        ret = NvBufSurfaceMap(nvbuf_surf, 0, 1, NVBUF_MAP_READ);
-        if (ret != 0) {
-            LOG_INFO("Failed to map UV plane");
-            return false;
-        }
-        NvBufSurfaceSyncForCpu(nvbuf_surf, 0, 1);
-
-        const uint32_t uv_pitch = nvbuf_surf->surfaceList[0].planeParams.pitch[1];
+        // Copy UV plane (plane 1)
+        const uint32_t uv_pitch = src_surf->surfaceList[0].planeParams.pitch[1];
         const int32_t uv_height = img_h / 2;
-        uint8_t *uv_src         = (uint8_t *)nvbuf_surf->surfaceList[0].mappedAddr.addr[1];
-
-        if (uv_src == nullptr) {
-            LOG_INFO("UV plane mapped address is null");
-            NvBufSurfaceUnMap(nvbuf_surf, 0, 1);
-            return false;
-        }
+        uint8_t *uv_src         = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[1];
 
         for (int32_t row = 0; row < uv_height; row++) {
             memcpy(yuv_data + offset, uv_src + row * uv_pitch, img_w);
             offset += img_w;
         }
-        NvBufSurfaceUnMap(nvbuf_surf, 0, 1);
 
     } else if (num_planes == 3) {
         // YUV420 planar format: Y, U, V separate planes
         static const int plane_divs[] = {1, 2, 2};
 
         for (int plane_idx = 0; plane_idx < 3; plane_idx++) {
-            ret = NvBufSurfaceMap(nvbuf_surf, 0, plane_idx, NVBUF_MAP_READ);
-            if (ret != 0) {
-                LOG_INFO("Failed to map plane %d", plane_idx);
-                return false;
-            }
-            NvBufSurfaceSyncForCpu(nvbuf_surf, 0, plane_idx);
-
             const int32_t plane_h      = img_h / plane_divs[plane_idx];
             const int32_t plane_w      = img_w / plane_divs[plane_idx];
-            const uint32_t plane_pitch = nvbuf_surf->surfaceList[0].planeParams.pitch[plane_idx];
-            uint8_t *src               = (uint8_t *)nvbuf_surf->surfaceList[0].mappedAddr.addr[plane_idx];
-
-            if (src == nullptr) {
-                LOG_INFO("Plane %d mapped address is null", plane_idx);
-                NvBufSurfaceUnMap(nvbuf_surf, 0, plane_idx);
-                return false;
-            }
+            const uint32_t plane_pitch = src_surf->surfaceList[0].planeParams.pitch[plane_idx];
+            uint8_t *src               = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[plane_idx];
 
             for (int32_t row = 0; row < plane_h; row++) {
                 memcpy(yuv_data + offset, src + row * plane_pitch, plane_w);
                 offset += plane_w;
             }
-            NvBufSurfaceUnMap(nvbuf_surf, 0, plane_idx);
         }
     } else {
         LOG_INFO("Unsupported plane count: %d", num_planes);
+        NvBufSurfaceUnMap(src_surf, 0, -1);
         return false;
     }
 
+    NvBufSurfaceUnMap(src_surf, 0, -1);
     return true;
 }
 
 
 
-/* @brief Copies YUV image data to an NVIDIA buffer using direct memory access (DMA)
- *        Processes the image in three planes (Y, U, and V), performing memory-mapped copies
- *        with proper stride handling for each plane. Ensures thread-safe buffer access and
- *        proper memory unmapping.
- * @param yuv_image: OpenCV Mat containing YUV420 format image data
- * @param dmabuf_fd: File descriptor for the target DMA buffer
- */
-bool CameraFeedWrapper::CvMat2NvBuffer(const cv::Mat &yuv_image, const int32_t dst_dmabuf_fd) {
+bool CameraFeedWrapper::CvMat2NvBuffer(const cv::Mat &yuv_image, NvBufSurface *dst_surf) {
 
-    if (yuv_image.empty() || dst_dmabuf_fd < 0) {
-        return false;
-    }
-
-    // Get NvBufSurface from fd (NEW API)
-    NvBufSurface *nvbuf_surf = nullptr;
-    int ret                  = NvBufSurfaceFromFd(dst_dmabuf_fd, (void **)(&nvbuf_surf));
-    if (ret != 0 || nvbuf_surf == nullptr) {
-        LOG_INFO("CvMat2NvBuffer: Failed to get NvBufSurface from fd %d", dst_dmabuf_fd);
+    if (yuv_image.empty() || !dst_surf) {
         return false;
     }
 
     const int32_t img_width   = yuv_image.cols;
     const int32_t img_height  = (yuv_image.rows * 2) / 3;
-    const uint32_t num_planes = nvbuf_surf->surfaceList[0].planeParams.num_planes;
+    const uint32_t num_planes = dst_surf->surfaceList[0].planeParams.num_planes;
 
     uint8_t *yuv_data = yuv_image.data;
     size_t src_offset = 0;
+
+    // Map all planes for writing
+    if (NvBufSurfaceMap(dst_surf, 0, -1, NVBUF_MAP_WRITE) != 0) {
+        LOG_INFO("Failed to map surface for write");
+        return false;
+    }
+
+    // Sync is not strictly needed before write if we overwrite everything,
+    // but good practice if partial update. We will sync for Device AFTER writing.
 
     if (num_planes == 2) {
         // NV12 format: Y plane + interleaved UV plane
 
         // Write Y plane
-        ret = NvBufSurfaceMap(nvbuf_surf, 0, 0, NVBUF_MAP_WRITE);
-        if (ret != 0) {
-            LOG_INFO("Failed to map Y plane for write");
-            return false;
-        }
-
-        const uint32_t y_pitch = nvbuf_surf->surfaceList[0].planeParams.pitch[0];
-        uint8_t *y_dst         = (uint8_t *)nvbuf_surf->surfaceList[0].mappedAddr.addr[0];
+        const uint32_t y_pitch = dst_surf->surfaceList[0].planeParams.pitch[0];
+        uint8_t *y_dst         = (uint8_t *)dst_surf->surfaceList[0].mappedAddr.addr[0];
 
         for (int32_t row = 0; row < img_height; row++) {
             memcpy(y_dst + row * y_pitch, yuv_data + src_offset, img_width);
             src_offset += img_width;
         }
 
-        NvBufSurfaceSyncForDevice(nvbuf_surf, 0, 0);
-        NvBufSurfaceUnMap(nvbuf_surf, 0, 0);
-
         // Write UV plane
-        ret = NvBufSurfaceMap(nvbuf_surf, 0, 1, NVBUF_MAP_WRITE);
-        if (ret != 0) {
-            LOG_INFO("Failed to map UV plane for write");
-            return false;
-        }
-
-        const uint32_t uv_pitch = nvbuf_surf->surfaceList[0].planeParams.pitch[1];
+        const uint32_t uv_pitch = dst_surf->surfaceList[0].planeParams.pitch[1];
         const int32_t uv_height = img_height / 2;
-        uint8_t *uv_dst         = (uint8_t *)nvbuf_surf->surfaceList[0].mappedAddr.addr[1];
+        uint8_t *uv_dst         = (uint8_t *)dst_surf->surfaceList[0].mappedAddr.addr[1];
 
         for (int32_t row = 0; row < uv_height; row++) {
             memcpy(uv_dst + row * uv_pitch, yuv_data + src_offset, img_width);
             src_offset += img_width;
         }
 
-        NvBufSurfaceSyncForDevice(nvbuf_surf, 0, 1);
-        NvBufSurfaceUnMap(nvbuf_surf, 0, 1);
-
     } else if (num_planes == 3) {
         // YUV420 planar: Y, U, V separate
         static const int plane_divs[] = {1, 2, 2};
 
         for (int plane_idx = 0; plane_idx < 3; plane_idx++) {
-            ret = NvBufSurfaceMap(nvbuf_surf, 0, plane_idx, NVBUF_MAP_WRITE);
-            if (ret != 0) {
-                LOG_INFO("Failed to map plane %d for write", plane_idx);
-                return false;
-            }
-
             const int32_t plane_width  = img_width / plane_divs[plane_idx];
             const int32_t plane_height = img_height / plane_divs[plane_idx];
-            const uint32_t plane_pitch = nvbuf_surf->surfaceList[0].planeParams.pitch[plane_idx];
-            uint8_t *dst               = (uint8_t *)nvbuf_surf->surfaceList[0].mappedAddr.addr[plane_idx];
+            const uint32_t plane_pitch = dst_surf->surfaceList[0].planeParams.pitch[plane_idx];
+            uint8_t *dst               = (uint8_t *)dst_surf->surfaceList[0].mappedAddr.addr[plane_idx];
 
             for (int row = 0; row < plane_height; row++) {
                 memcpy(dst + row * plane_pitch, yuv_data + src_offset, plane_width);
                 src_offset += plane_width;
             }
-
-            NvBufSurfaceSyncForDevice(nvbuf_surf, 0, plane_idx);
-            NvBufSurfaceUnMap(nvbuf_surf, 0, plane_idx);
         }
     } else {
         LOG_INFO("CvMat2NvBuffer: Unsupported plane count: %d", num_planes);
+        NvBufSurfaceUnMap(dst_surf, 0, -1);
         return false;
     }
+
+    NvBufSurfaceSyncForDevice(dst_surf, 0, -1);
+    NvBufSurfaceUnMap(dst_surf, 0, -1);
 
     return true;
 }
 
 bool CameraFeedWrapper::resizeFrame(
-        const int32_t srcDmaBuf,
-        const int32_t dstDmaBuf,
+        NvBufSurface *srcSurf,
+        NvBufSurface *dstSurf,
         const int32_t srcWidth,
         const int32_t srcHeight,
         const int32_t dstWidth,
         const int32_t dstHeight) {
 
-    NvBufferTransformParams transform_resize_params = {0};
-    transform_resize_params.src_rect.top            = 0;
-    transform_resize_params.src_rect.left           = 0;
-    transform_resize_params.src_rect.width          = srcWidth;
-    transform_resize_params.src_rect.height         = srcHeight;
-    transform_resize_params.dst_rect.top            = 0;
-    transform_resize_params.dst_rect.left           = 0;
-    transform_resize_params.dst_rect.width          = dstWidth;
-    transform_resize_params.dst_rect.height         = dstHeight;
-    transform_resize_params.transform_flag          = NVBUFFER_TRANSFORM_FILTER;
-    transform_resize_params.transform_flip          = NvBufferTransform_None;
-    transform_resize_params.transform_filter        = NvBufferTransform_Filter_Nicest;
+    NvBufSurfTransformParams transform_params;
+    memset(&transform_params, 0, sizeof(transform_params));
 
-    return (NvBufferTransform(srcDmaBuf, dstDmaBuf, &transform_resize_params) == 0);
+    NvBufSurfTransformRect srcRect = {0, 0, (uint32_t)srcWidth, (uint32_t)srcHeight};
+    NvBufSurfTransformRect dstRect = {0, 0, (uint32_t)dstWidth, (uint32_t)dstHeight};
+
+    transform_params.src_rect         = &srcRect;
+    transform_params.dst_rect         = &dstRect;
+    transform_params.transform_flag   = NVBUFSURF_TRANSFORM_FILTER;
+    transform_params.transform_flip   = NvBufSurfTransform_None;
+    transform_params.transform_filter = NvBufSurfTransformInter_Algo4;  // Nicest
+
+    return (NvBufSurfTransform(srcSurf, dstSurf, &transform_params) == NvBufSurfTransformError_Success);
 }
 
-void CameraFeedWrapper::NvBuffer2Jpeg(const int src_dmabuf_fd, std::vector<uint8_t> &jpeg_buffer) {
+void CameraFeedWrapper::NvBuffer2Jpeg(NvBufSurface *src_surf, std::vector<uint8_t> &jpeg_buffer) {
 
-    // Get buffer parameters
-    NvBufferParams dst_params;
-
-    if (!jpeg_encoder || NvBufferGetParams(src_dmabuf_fd, &dst_params) < 0) {
-        nvBuffer2CvMat(jpeg_yuv_image, src_dmabuf_fd);
+    if (!jpeg_encoder || !src_surf) {
+        // Fallback to OpenCV if hardware encoder is not available
+        nvBuffer2CvMat(jpeg_yuv_image, src_surf);
         cv::cvtColor(jpeg_yuv_image, jpeg_bgr_image, cv::COLOR_YUV2BGR_I420);
 
         jpeg_buffer.clear();
@@ -579,14 +521,16 @@ void CameraFeedWrapper::NvBuffer2Jpeg(const int src_dmabuf_fd, std::vector<uint8
         return;
     }
 
-    const int32_t img_h       = dst_params.height[0];
-    const int32_t img_w       = dst_params.width[0];
+    // NvJpegEncoder expects a file descriptor
+    int fd                    = (int)src_surf->surfaceList[0].bufferDesc;
+    const int32_t img_h       = src_surf->surfaceList[0].height;
+    const int32_t img_w       = src_surf->surfaceList[0].width;
     unsigned long out_bufSize = img_h * img_w * 3 / 2;
 
     jpeg_buffer.resize(out_bufSize);
     uint8_t *buffer_ptr = jpeg_buffer.data();
 
-    jpeg_encoder->encodeFromFd(src_dmabuf_fd, JCS_YCbCr, &buffer_ptr, out_bufSize, 80);
+    jpeg_encoder->encodeFromFd(fd, JCS_YCbCr, &buffer_ptr, out_bufSize, 80);
     jpeg_buffer.resize(out_bufSize);
     return;
 }

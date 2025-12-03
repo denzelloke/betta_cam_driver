@@ -27,6 +27,10 @@
 #include <NvJpegEncoder.h>
 #include <Value.h>
 
+// NvUtils (New API)
+#include <nvbufsurface.h>
+#include <nvbufsurftransform.h>
+
 // Threading
 #include <mutex>
 
@@ -40,11 +44,11 @@ using namespace EGLStream;
 #define IMAGE_WIDTH_720  1'280
 #define IMAGE_HEIGHT_720 720
 
-#define VEHICLE_INFO_PATH      "/home/aib/.ikan-bilis/VehicleInfo.yaml"
-#define MAIN_HULL_FIELD        "Main_Hull_ID"
-#define VEHICLE_IP             "192.168.1.1"
-#define VEHICLE_USERNAME       "aib"
-#define VEHICLE_PWD            "bb"
+#define VEHICLE_INFO_PATH "/home/aib/.ikan-bilis/VehicleInfo.yaml"
+#define MAIN_HULL_FIELD   "Main_Hull_ID"
+#define VEHICLE_IP        "192.168.1.1"
+#define VEHICLE_USERNAME  "aib"
+#define VEHICLE_PWD       "bb"
 
 #define VEHICLE_ODOMETRY_TOPIC "/ikan/nav/world_ned_msl"
 
@@ -62,7 +66,8 @@ public:
     virtual void captureAndPublishOnce(Srv_CamGetSnapshot_Response *res_ptr) = 0;
 
 protected:
-    const int32_t dma_buf_2K;
+    // MIGRATION: Changed from int32_t fd to NvBufSurface*
+    NvBufSurface *dma_buf_2K;
     float camera_depth = 0.0F;
 
     bool publishH264Feed(const NV::IImageNativeBuffer *iNativeBuffer, Srv_CamGetSnapshot_Response *res_ptr);
@@ -83,7 +88,9 @@ private:
 
     // Camera interface settings
     std::mutex feed_mutex;
-    const int32_t dma_buf_HD;
+
+    // MIGRATION: Changed from int32_t fd to NvBufSurface*
+    NvBufSurface *dma_buf_HD;
 
     // Helper Class
     cv::Mat img_YUV_2K, img_YUV_FHD;
@@ -115,25 +122,27 @@ private:
     // -----------------------------------------------------
     // Initialisation functions
     // -----------------------------------------------------
-    int32_t initialiseDmaBuffer(const int32_t img_width, const int32_t img_height);
+    // MIGRATION: Returns NvBufSurface* instead of fd
+    NvBufSurface *initialiseDmaBuffer(const int32_t img_width, const int32_t img_height);
     void initialiseRosBindings(const std::string &frame_id, const std::string &ros_topic_root_name);
 
 
     // -----------------------------------------------------
     // NvBuffer Helper functions
     // -----------------------------------------------------
-    bool nvBuffer2CvMat(cv::Mat &out_yuv_image, const int32_t src_dmabuf_fd);
-    bool CvMat2NvBuffer(const cv::Mat &yuv_image, const int32_t dst_dmabuf_fd);
+    // MIGRATION: Takes NvBufSurface*
+    bool nvBuffer2CvMat(cv::Mat &out_yuv_image, NvBufSurface *src_surf);
+    bool CvMat2NvBuffer(const cv::Mat &yuv_image, NvBufSurface *dst_surf);
     bool resizeFrame(
-            const int32_t srcDmaBuf,
-            const int32_t dstDmaBuf,
+            NvBufSurface *srcSurf,
+            NvBufSurface *dstSurf,
             const int32_t srcWidth,
             const int32_t srcHeight,
             const int32_t dstWidth,
             const int32_t dstHeight);
 
     cv::Mat jpeg_yuv_image, jpeg_bgr_image;
-    void NvBuffer2Jpeg(const int src_dmabuf_fd, std::vector<uint8_t> &jpeg_buffer);
+    void NvBuffer2Jpeg(NvBufSurface *src_surf, std::vector<uint8_t> &jpeg_buffer);
 
 
     // -----------------------------------------------------

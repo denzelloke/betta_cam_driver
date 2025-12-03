@@ -125,6 +125,7 @@ H264Encoder::H264Encoder(int32_t width, int32_t height, int32_t bitrate, int32_t
     ret = ctx->enc->setFrameRate(ctx->fps_n, 1);
     TEST_ERROR(ret < 0, "Could not set framerate");
 
+    // MIGRATION: V4L2_MEMORY_MMAP with map=true to allow CPU memcpy
     ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_MMAP, ENC_MAX_BUFFERS, true, true);
     TEST_ERROR(ret < 0, "Could not setup output plane");
 
@@ -169,20 +170,14 @@ H264Encoder::~H264Encoder() {
     delete ctx;
 }
 
-bool H264Encoder::encodeFrame(Msg_ImageH264Feed &msg, const int32_t dma_bf_fd) {
-    if (!nvmpi_encoder_put_frame(dma_bf_fd)) {
-        printf("whatsup 1");
+bool H264Encoder::encodeFrame(Msg_ImageH264Feed &msg, NvBufSurface *src_surf) {
+    if (!nvmpi_encoder_put_frame(src_surf)) {
         return false;
     }
 
     if (!nvmpi_encoder_get_packet(msg)) {
-        // The queue is empty. This is NORMAL for the first few frames (latency)
-        // or if the encoder is buffering (B-frames/pipelining).
-
-        // Clear the data to indicate "no new data this time"
+        // Return TRUE to indicate no error, just no data ready yet (buffering/latency)
         msg.data.clear();
-
-        // Return TRUE because the encoder is healthy and working.
         return true;
     }
 
@@ -192,7 +187,7 @@ bool H264Encoder::encodeFrame(Msg_ImageH264Feed &msg, const int32_t dma_bf_fd) {
     return true;
 }
 
-bool H264Encoder::nvmpi_encoder_put_frame(const int32_t dma_bf_fd) {
+bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
     struct v4l2_buffer v4l2_buf;
     struct v4l2_plane planes[MAX_PLANES];
     NvBuffer *nvBuffer;
@@ -206,7 +201,6 @@ bool H264Encoder::nvmpi_encoder_put_frame(const int32_t dma_bf_fd) {
         return false;
     }
 
-    // Copy the dma buffer to the nvbuffer
     if (ctx->in_frame_buffer_index < ctx->enc->output_plane.getNumBuffers()) {
         nvBuffer       = ctx->enc->output_plane.getNthBuffer(ctx->in_frame_buffer_index);
         v4l2_buf.index = ctx->in_frame_buffer_index;
@@ -214,52 +208,64 @@ bool H264Encoder::nvmpi_encoder_put_frame(const int32_t dma_bf_fd) {
     } else if (ctx->enc->output_plane.dqBuffer(v4l2_buf, &nvBuffer, NULL, -1) < 0) {
         return false;
     }
-    ctx->in_frame_buffer_index++;
 
+    // --- FIX 1: Correct Timestamp Calculation ---
+    // Old logic: (index * 1000000) % (fps * 1000000) -> Invalid if index >= fps
+    uint64_t timestamp_us = (uint64_t)ctx->in_frame_buffer_index * 1000000 / ctx->fps_n;
     v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-    v4l2_buf.timestamp.tv_usec = (ctx->in_frame_buffer_index * 1'000'000) % (ctx->fps_n * 1'000'000);
-    v4l2_buf.timestamp.tv_sec  = ctx->in_frame_buffer_index / ctx->fps_n;
+    v4l2_buf.timestamp.tv_sec  = timestamp_us / 1000000;
+    v4l2_buf.timestamp.tv_usec = timestamp_us % 1000000;
+
+    ctx->in_frame_buffer_index++;
 
     // Fill plane sizes
     const int32_t plane_y_sizes  = ctx->width * ctx->height;
     const int32_t plane_uv_sizes = plane_y_sizes / 4;
 
-    // Fill NvBuffer
     nvBuffer->planes[0].bytesused = plane_y_sizes;
     nvBuffer->planes[1].bytesused = plane_uv_sizes;
     nvBuffer->planes[2].bytesused = plane_uv_sizes;
 
-    // Copy the bytesused values to the v4l2_buf planes so the driver knows the size
+    // --- FIX 2: Copy bytesused to v4l2_buf ---
+    // The driver checks this structure, NOT just the NvBuffer.
+    // Without this loop, frames are 0-byte and dropped by the encoder.
     for (int i = 0; i < MAX_PLANES; i++) {
-        // v4l2_buf.m.planes points to your local 'planes' array
         v4l2_buf.m.planes[i].bytesused = nvBuffer->planes[i].bytesused;
     }
 
-    NvBufferParams dst_params;
-    if (NvBufferGetParams(dma_bf_fd, &dst_params) < 0) {
+    // Map source surface (from Decoder or Camera)
+    if (NvBufSurfaceMap(src_surf, 0, -1, NVBUF_MAP_READ) != 0) {
+        printf("Failed to map source surface in H264Encoder\n");
         return false;
     }
+    NvBufSurfaceSyncForCpu(src_surf, 0, -1);
 
+    // Copy data (CPU Copy)
     for (int channel_idx = 0; channel_idx < 3; channel_idx++) {
-        void *src_data = nullptr;
-        if (NvBufferMemMap(dma_bf_fd, channel_idx, NvBufferMem_Read, &src_data) != 0) {
-            return false;
-        }
-
         const int32_t step_divisor = (channel_idx == 0) ? 1 : 2;
         const int32_t plane_h      = ctx->height / step_divisor;
         const int32_t plane_w      = ctx->width / step_divisor;
-        const int32_t plane_pitch  = dst_params.pitch[channel_idx];
 
-        uint8_t *src = static_cast<uint8_t *>(src_data);
-        uint8_t *dst = static_cast<uint8_t *>(nvBuffer->planes[channel_idx].data);
-        for (int32_t row = 0; row < plane_h; row++) {
-            memcpy(dst + row * plane_w, src + row * plane_pitch, plane_w);
+        // Handle pitch differences
+        uint32_t src_pitch = src_surf->surfaceList[0].planeParams.pitch[channel_idx];
+        uint32_t dst_pitch = nvBuffer->planes[channel_idx].fmt.stride;
+
+        uint8_t *src = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[channel_idx];
+        uint8_t *dst = (uint8_t *)nvBuffer->planes[channel_idx].data;
+
+        // Copy row by row if pitches differ, otherwise single memcpy
+        if (src_pitch == dst_pitch && src_pitch == (uint32_t)plane_w) {
+             memcpy(dst, src, plane_w * plane_h);
+        } else {
+             for (int32_t row = 0; row < plane_h; row++) {
+                 memcpy(dst + row * dst_pitch, src + row * src_pitch, plane_w);
+             }
         }
-
-        NvBufferMemUnMap(dma_bf_fd, channel_idx, &src_data);
     }
 
+    NvBufSurfaceUnMap(src_surf, 0, -1);
+
+    // Queue the buffer for encoding
     int32_t ret = ctx->enc->output_plane.qBuffer(v4l2_buf, NULL);
     TEST_ERROR(ret < 0, "Error while queueing buffer at output plane");
 
@@ -277,7 +283,7 @@ bool H264Encoder::nvmpi_encoder_get_packet(Msg_ImageH264Feed &msg) {
     ctx->packet_pools.pop();
 
     uint32_t size = ctx->packets_size[packet_index];
-    if (size == 0) {  // Old packet, but 0-0 skip!
+    if (size == 0) {
         return false;
     }
 

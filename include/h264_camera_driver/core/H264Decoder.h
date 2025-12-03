@@ -6,12 +6,13 @@
 #include <bx_msgs/RateLimiter.hpp>
 #include <bx_msgs/RosBindings.hpp>
 
-#include <NvBuffer.h>
-// #include <nvbuf_utils.h>
-#include <h264_camera_driver/compat/nvbuf_compat.h>
+// MIGRATION: New API Includes
+#include <nvbufsurface.h>
+#include <nvbufsurftransform.h>
 
+#include <queue>
+#include <vector>
 #include "NvVideoDecoder.h"
-
 
 class H264Decoder {
 public:
@@ -19,7 +20,9 @@ public:
     ~H264Decoder();
 
     bool decoder_put_packet(const Msg_ImageH264Feed_ConstPtr &msg);
-    bool decoder_get_frame(const int32_t out_dma_buf_2K);
+
+    // MIGRATION: Changed to take NvBufSurface*
+    bool decoder_get_frame(NvBufSurface *out_dma_buf_2K);
 
 private:
     bool has_first_frame = false;
@@ -37,8 +40,14 @@ private:
     std::mutex buffer_mutex;
 
     std::queue<int32_t> frame_pools;
-    SafeVector<int32_t> dmaBufferFileDescriptors;
-    NvBufferTransformParams transform_params;
+
+    // MIGRATION: Store Surfaces instead of FDs
+    std::vector<NvBufSurface *> output_surfaces;
+
+    // MIGRATION: New Transform Params
+    NvBufSurfTransformParams transform_params;
+    NvBufSurfTransformRect src_rect;
+    NvBufSurfTransformRect dst_rect;
 
     void respondToResolutionEvent();
     void dec_capture_loop_fcn();
