@@ -193,12 +193,104 @@ bool H264Encoder::encodeFrame(Msg_ImageH264Feed &msg, NvBufSurface *src_surf) {
     return true;
 }
 
-bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
-    printf("[ENCODER PUT] Start, in_buffer_index=%d\n", ctx->in_frame_buffer_index);
+// bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
+//     printf("[ENCODER PUT] Start, in_buffer_index=%d\n", ctx->in_frame_buffer_index);
 
+//     struct v4l2_buffer v4l2_buf;
+//     struct v4l2_plane planes[MAX_PLANES];
+//     NvBuffer *nvBuffer;
+
+//     memset(&v4l2_buf, 0, sizeof(v4l2_buf));
+//     memset(planes, 0, sizeof(planes));
+//     v4l2_buf.m.planes = planes;
+
+//     if (ctx->enc->isInError()) {
+//         printf("[ENCODER PUT] ERROR: Encoder is in error state!\n");
+//         return false;
+//     }
+
+//     if (ctx->in_frame_buffer_index < ctx->enc->output_plane.getNumBuffers()) {
+//         nvBuffer       = ctx->enc->output_plane.getNthBuffer(ctx->in_frame_buffer_index);
+//         v4l2_buf.index = ctx->in_frame_buffer_index;
+//         printf("[ENCODER PUT] Using buffer index %d (initial phase)\n", v4l2_buf.index);
+//     } else if (ctx->enc->output_plane.dqBuffer(v4l2_buf, &nvBuffer, NULL, -1) < 0) {
+//         printf("[ENCODER PUT] ERROR: Failed to dqBuffer from output plane!\n");
+//         return false;
+//     } else {
+//         printf("[ENCODER PUT] Using buffer index %d (recycled)\n", v4l2_buf.index);
+//     }
+
+//     uint64_t timestamp_us = (uint64_t)ctx->in_frame_buffer_index * 1'000'000 / ctx->fps_n;
+//     v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
+//     v4l2_buf.timestamp.tv_sec  = timestamp_us / 1'000'000;
+//     v4l2_buf.timestamp.tv_usec = timestamp_us % 1'000'000;
+//     ctx->in_frame_buffer_index++;
+
+//     // NV12 Size Calculation (2 Planes)
+//     const int32_t plane_y_bytes  = ctx->width * ctx->height;
+//     const int32_t plane_uv_bytes = ctx->width * (ctx->height / 2);
+
+//     nvBuffer->planes[0].bytesused = plane_y_bytes;
+//     nvBuffer->planes[1].bytesused = plane_uv_bytes;
+
+//     printf("[ENCODER PUT] Set bytesused: plane0=%d, plane1=%d\n",
+//            nvBuffer->planes[0].bytesused,
+//            nvBuffer->planes[1].bytesused);
+
+//     for (int i = 0; i < MAX_PLANES; i++) {
+//         v4l2_buf.m.planes[i].bytesused = nvBuffer->planes[i].bytesused;
+//     }
+
+//     printf("[ENCODER PUT] Mapping source surface...\n");
+//     if (NvBufSurfaceMap(src_surf, 0, -1, NVBUF_MAP_READ) != 0) {
+//         printf("[ENCODER PUT] ERROR: Failed to map source surface!\n");
+//         return false;
+//     }
+//     NvBufSurfaceSyncForCpu(src_surf, 0, -1);
+
+//     printf("[ENCODER PUT] Copying YUV data (NV12)...\n");
+//     // COPY LOGIC FOR NV12 (2 PLANES ONLY)
+//     for (int i = 0; i < 2; i++) {
+//         const int32_t plane_h = (i == 0) ? ctx->height : (ctx->height / 2);
+//         const int32_t plane_w = ctx->width;
+//         uint32_t src_pitch    = src_surf->surfaceList[0].planeParams.pitch[i];
+//         uint32_t dst_pitch    = nvBuffer->planes[i].fmt.stride;
+//         uint8_t *src          = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[i];
+//         uint8_t *dst          = (uint8_t *)nvBuffer->planes[i].data;
+
+//         printf("[ENCODER PUT] Plane %d: h=%d, w=%d, src_pitch=%u, dst_pitch=%u\n",
+//                i,
+//                plane_h,
+//                plane_w,
+//                src_pitch,
+//                dst_pitch);
+
+//         if (src_pitch == dst_pitch && src_pitch == (uint32_t)plane_w) {
+//             memcpy(dst, src, plane_w * plane_h);
+//         } else {
+//             for (int32_t row = 0; row < plane_h; row++) {
+//                 memcpy(dst + row * dst_pitch, src + row * src_pitch, plane_w);
+//             }
+//         }
+//     }
+//     NvBufSurfaceUnMap(src_surf, 0, -1);
+
+//     printf("[ENCODER PUT] Queueing buffer to encoder...\n");
+//     int ret = ctx->enc->output_plane.qBuffer(v4l2_buf, NULL);
+//     if (ret < 0) {
+//         printf("[ENCODER PUT] ERROR: Failed to qBuffer! ret=%d\n", ret);
+//         return false;
+//     }
+
+//     printf("[ENCODER PUT] Success!\n");
+//     return true;
+// }
+
+
+bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
     struct v4l2_buffer v4l2_buf;
     struct v4l2_plane planes[MAX_PLANES];
-    NvBuffer *nvBuffer;
+    NvBuffer *dst_nv_buffer;
 
     memset(&v4l2_buf, 0, sizeof(v4l2_buf));
     memset(planes, 0, sizeof(planes));
@@ -209,80 +301,76 @@ bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
         return false;
     }
 
+    // 1. Get the destination buffer (The Encoder's Buffer)
     if (ctx->in_frame_buffer_index < ctx->enc->output_plane.getNumBuffers()) {
-        nvBuffer       = ctx->enc->output_plane.getNthBuffer(ctx->in_frame_buffer_index);
+        dst_nv_buffer  = ctx->enc->output_plane.getNthBuffer(ctx->in_frame_buffer_index);
         v4l2_buf.index = ctx->in_frame_buffer_index;
-        printf("[ENCODER PUT] Using buffer index %d (initial phase)\n", v4l2_buf.index);
-    } else if (ctx->enc->output_plane.dqBuffer(v4l2_buf, &nvBuffer, NULL, -1) < 0) {
-        printf("[ENCODER PUT] ERROR: Failed to dqBuffer from output plane!\n");
-        return false;
     } else {
-        printf("[ENCODER PUT] Using buffer index %d (recycled)\n", v4l2_buf.index);
+        if (ctx->enc->output_plane.dqBuffer(v4l2_buf, &dst_nv_buffer, NULL, -1) < 0) {
+            printf("[ENCODER PUT] ERROR: Failed to dqBuffer from output plane!\n");
+            return false;
+        }
     }
 
+    // 2. Set Timestamp
     uint64_t timestamp_us = (uint64_t)ctx->in_frame_buffer_index * 1'000'000 / ctx->fps_n;
     v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
     v4l2_buf.timestamp.tv_sec  = timestamp_us / 1'000'000;
     v4l2_buf.timestamp.tv_usec = timestamp_us % 1'000'000;
     ctx->in_frame_buffer_index++;
 
-    // NV12 Size Calculation (2 Planes)
+    // =========================================================================
+    // FIX: Use NvUtils Hardware Transform (Migration Compliant)
+    // =========================================================================
+
+    // A. Wrap the Encoder's Buffer FD in an NvBufSurface
+    NvBufSurface *dst_surf = NULL;
+    int dst_fd             = dst_nv_buffer->planes[0].fd;
+
+    // NvBufSurfaceFromFd creates a wrapper surface around the existing FD
+    if (NvBufSurfaceFromFd(dst_fd, (void **)&dst_surf) != 0) {
+        printf("[ENCODER PUT] ERROR: NvBufSurfaceFromFd failed!\n");
+        return false;
+    }
+
+    // B. Configure the Transform
+    NvBufSurfTransformParams trans_params;
+    memset(&trans_params, 0, sizeof(trans_params));
+    trans_params.transform_flag   = NVBUFSURF_TRANSFORM_FILTER;
+    trans_params.transform_filter = NvBufSurfTransformInter_Algo3;  // Smart/Quality Filter
+
+    // C. Perform Copy & Layout Conversion (Pitch -> Block Linear)
+    if (NvBufSurfTransform(src_surf, dst_surf, &trans_params) != 0) {
+        printf("[ENCODER PUT] ERROR: NvBufSurfTransform failed!\n");
+        // Do NOT destroy dst_surf here, just return failure
+        return false;
+    }
+
+    // D. CRITICAL FIX: Do NOT call NvBufSurfaceDestroy(dst_surf)!
+    // The surface wraps the Encoder's buffer. Destroying it frees the Encoder's memory,
+    // causing the Segfault in qBuffer. We just leave it alone.
+
+    // =========================================================================
+
+    // 3. Set bytesused (Required for V4L2)
+    // NV12 Calculation: Y Plane + UV Plane
     const int32_t plane_y_bytes  = ctx->width * ctx->height;
     const int32_t plane_uv_bytes = ctx->width * (ctx->height / 2);
 
-    nvBuffer->planes[0].bytesused = plane_y_bytes;
-    nvBuffer->planes[1].bytesused = plane_uv_bytes;
-
-    printf("[ENCODER PUT] Set bytesused: plane0=%d, plane1=%d\n",
-           nvBuffer->planes[0].bytesused,
-           nvBuffer->planes[1].bytesused);
+    // Note: We set this on the underlying NvBuffer so qBuffer picks it up correctly
+    dst_nv_buffer->planes[0].bytesused = plane_y_bytes;
+    dst_nv_buffer->planes[1].bytesused = plane_uv_bytes;
 
     for (int i = 0; i < MAX_PLANES; i++) {
-        v4l2_buf.m.planes[i].bytesused = nvBuffer->planes[i].bytesused;
+        v4l2_buf.m.planes[i].bytesused = dst_nv_buffer->planes[i].bytesused;
     }
 
-    printf("[ENCODER PUT] Mapping source surface...\n");
-    if (NvBufSurfaceMap(src_surf, 0, -1, NVBUF_MAP_READ) != 0) {
-        printf("[ENCODER PUT] ERROR: Failed to map source surface!\n");
-        return false;
-    }
-    NvBufSurfaceSyncForCpu(src_surf, 0, -1);
-
-    printf("[ENCODER PUT] Copying YUV data (NV12)...\n");
-    // COPY LOGIC FOR NV12 (2 PLANES ONLY)
-    for (int i = 0; i < 2; i++) {
-        const int32_t plane_h = (i == 0) ? ctx->height : (ctx->height / 2);
-        const int32_t plane_w = ctx->width;
-        uint32_t src_pitch    = src_surf->surfaceList[0].planeParams.pitch[i];
-        uint32_t dst_pitch    = nvBuffer->planes[i].fmt.stride;
-        uint8_t *src          = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[i];
-        uint8_t *dst          = (uint8_t *)nvBuffer->planes[i].data;
-
-        printf("[ENCODER PUT] Plane %d: h=%d, w=%d, src_pitch=%u, dst_pitch=%u\n",
-               i,
-               plane_h,
-               plane_w,
-               src_pitch,
-               dst_pitch);
-
-        if (src_pitch == dst_pitch && src_pitch == (uint32_t)plane_w) {
-            memcpy(dst, src, plane_w * plane_h);
-        } else {
-            for (int32_t row = 0; row < plane_h; row++) {
-                memcpy(dst + row * dst_pitch, src + row * src_pitch, plane_w);
-            }
-        }
-    }
-    NvBufSurfaceUnMap(src_surf, 0, -1);
-
-    printf("[ENCODER PUT] Queueing buffer to encoder...\n");
-    int ret = ctx->enc->output_plane.qBuffer(v4l2_buf, NULL);
-    if (ret < 0) {
-        printf("[ENCODER PUT] ERROR: Failed to qBuffer! ret=%d\n", ret);
+    // 4. Queue Buffer
+    if (ctx->enc->output_plane.qBuffer(v4l2_buf, NULL) < 0) {
+        printf("[ENCODER PUT] ERROR: Failed to qBuffer!\n");
         return false;
     }
 
-    printf("[ENCODER PUT] Success!\n");
     return true;
 }
 
