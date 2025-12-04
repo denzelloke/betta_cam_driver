@@ -34,7 +34,7 @@ bool H264Decoder::decoder_put_packet(const Msg_ImageH264Feed_ConstPtr &msg) {
             if (log_counter++ % 30 == 0) {
                 printf("nal_type: %d Waiting for first I frame (IDR/SPS/PPS)...\n", nal_type);
             }
-            return false;
+            return false;   
         }
     }
 
@@ -195,7 +195,7 @@ void H264Decoder::respondToResolutionEvent() {
         TEST_ERROR(ret < 0, "Failed to create buffers");
 
         new_surf->numFilled = 1;
-        
+
         output_surfaces.push_back(new_surf);
 
         struct v4l2_buffer v4l2_buf;

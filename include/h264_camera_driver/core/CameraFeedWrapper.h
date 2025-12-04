@@ -123,7 +123,7 @@ private:
     // Initialisation functions
     // -----------------------------------------------------
     // MIGRATION: Returns NvBufSurface* instead of fd
-    NvBufSurface *initialiseDmaBuffer(const int32_t img_width, const int32_t img_height);
+    NvBufSurface *initialiseDmaBuffer(const int32_t img_width, const int32_t img_height, NvBufSurfaceLayout layout);
     void initialiseRosBindings(const std::string &frame_id, const std::string &ros_topic_root_name);
 
 

@@ -13,8 +13,8 @@ CameraFeedWrapper::CameraFeedWrapper(
         const std::string ros_topic_root_name,
         std::string calibration_file_path,
         const bool use_hw_jpeg_encoder)
-        : dma_buf_2K(initialiseDmaBuffer(IMAGE_WIDTH_2K, IMAGE_HEIGHT_2K)),
-          dma_buf_HD(initialiseDmaBuffer(IMAGE_WIDTH_720, IMAGE_HEIGHT_720)),
+        : dma_buf_2K(initialiseDmaBuffer(IMAGE_WIDTH_2K, IMAGE_HEIGHT_2K, NVBUF_LAYOUT_PITCH)),
+          dma_buf_HD(initialiseDmaBuffer(IMAGE_WIDTH_720, IMAGE_HEIGHT_720, NVBUF_LAYOUT_PITCH)),
 
           h264_clahe_2k_encoder(nullptr),
           h264_raw_hd_encoder(nullptr),
@@ -70,6 +70,8 @@ CameraFeedWrapper::~CameraFeedWrapper() {
     pub_clahe_224_jpeg.shutdown();
 }
 
+
+// for denzel: this one! >:0
 bool CameraFeedWrapper::publishH264Feed(
         const NV::IImageNativeBuffer *iNativeBuffer,
         Srv_CamGetSnapshot_Response *res_ptr) {
@@ -85,6 +87,8 @@ bool CameraFeedWrapper::publishH264Feed(
 
     return spinH264FeedOnce(res_ptr);
 }
+///////////////////////////////////////////////////////////////////////////////
+
 
 bool CameraFeedWrapper::publishH264Feed(Srv_CamGetSnapshot_Response *res_ptr, uint64_t timestamp_ms) {
 
@@ -282,12 +286,17 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
 // Initialisation functions
 // -----------------------------------------------------
 
-NvBufSurface *CameraFeedWrapper::initialiseDmaBuffer(const int32_t img_width, const int32_t img_height) {
+NvBufSurface *CameraFeedWrapper::initialiseDmaBuffer(
+        const int32_t img_width,
+        const int32_t img_height,
+        NvBufSurfaceLayout layout) {
 
     NvBufSurfaceAllocateParams input_params = {0};
     input_params.params.width               = img_width;
     input_params.params.height              = img_height;
-    input_params.params.layout              = NVBUF_LAYOUT_PITCH;
+    input_params.params.layout              = layout;  // Use the passed argument
+    input_params.params.colorFormat         = NVBUF_COLOR_FORMAT_NV12;
+    input_params.params.memType             = NVBUF_MEM_SURFACE_ARRAY;
     input_params.params.colorFormat         = NVBUF_COLOR_FORMAT_NV12;
     input_params.params.memType             = NVBUF_MEM_SURFACE_ARRAY;
 
@@ -296,7 +305,6 @@ NvBufSurface *CameraFeedWrapper::initialiseDmaBuffer(const int32_t img_width, co
         raiseFatal("Failed to create NvBufSurface of size: %dx%d!", img_width, img_height);
     }
 
-    // ADD THIS LINE:
     new_surf->numFilled = 1;
 
     // Explicitly zero out the buffer
@@ -365,6 +373,11 @@ bool CameraFeedWrapper::nvBuffer2CvMat(cv::Mat &out_yuv_image, NvBufSurface *src
         return false;
     }
 
+    // if (num_planes != 2) {
+    //     ROS_ERROR("Expected 2 planes for NV12, got %d", num_planes);
+    //     return false;
+    // }
+
     // 2. Create/resize output Mat for YUV (height * 1.5)
     const int32_t mat_height = (img_h * 3) / 2;
     if (out_yuv_image.empty() || out_yuv_image.rows != mat_height || out_yuv_image.cols != img_w) {
@@ -388,6 +401,7 @@ bool CameraFeedWrapper::nvBuffer2CvMat(cv::Mat &out_yuv_image, NvBufSurface *src
         // NV12 format: Y plane + interleaved UV plane
 
         // Copy Y plane (plane 0)
+
         const uint32_t y_pitch = src_surf->surfaceList[0].planeParams.pitch[0];
         uint8_t *y_src         = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[0];
 
