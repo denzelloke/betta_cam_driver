@@ -200,18 +200,33 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
         NvBuffer2Jpeg(dma_buf_2K, res_ptr->raw_image_data);
     }
 
-    // Publish the Raw HD H264 feed
-    resizeFrame(dma_buf_2K, dma_buf_HD, IMAGE_WIDTH_2K, IMAGE_HEIGHT_2K, IMAGE_WIDTH_720, IMAGE_HEIGHT_720);
-    if (h264_raw_hd_encoder->encodeFrame(h264_msg, dma_buf_HD)) {
+    // Publish the Raw HD H264 feed ///////////
+    ROS_INFO("About to resize frame for Raw HD");
+    bool resize_success =
+            resizeFrame(dma_buf_2K, dma_buf_HD, IMAGE_WIDTH_2K, IMAGE_HEIGHT_2K, IMAGE_WIDTH_720, IMAGE_HEIGHT_720);
+    ROS_INFO("Resize result: %d", resize_success);
+
+    if (!resize_success) {
+        ROS_ERROR("Failed to resize frame for Raw HD encoder!");
+    }
+
+    ROS_INFO("About to encode Raw HD frame, seq_id=%u", h264_msg.seq_id);
+    bool encode_result = h264_raw_hd_encoder->encodeFrame(h264_msg, dma_buf_HD);
+    ROS_INFO("Raw HD encode result: %d, data size: %zu", encode_result, h264_msg.data.size());
+
+    if (encode_result) {
         if (!h264_msg.data.empty()) {
+            ROS_INFO("Publishing Raw HD H264 packet, size=%zu", h264_msg.data.size());
             PUBLISH_ROS(pub_raw_hd_h264, h264_msg);
+        } else {
+            ROS_WARN("Raw HD encoder returned empty data (buffering)");
         }
         SET_NODE_STATUS_OK();
-
     } else {
-        ROS_ERROR("H264 encoding failed for RAW HD frame - No Encoder");
+        ROS_ERROR("H264 encoding failed for RAW HD frame - Encoder error");
         SET_NODE_STATUS_CRITICAL_ERROR();
     }
+    //////////////////////////////////
 
     // Process the CLAHE as a 2K Frame
     nvBuffer2CvMat(img_YUV_2K, dma_buf_2K);
