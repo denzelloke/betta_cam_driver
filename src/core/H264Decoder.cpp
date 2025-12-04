@@ -194,6 +194,8 @@ void H264Decoder::respondToResolutionEvent() {
         ret                    = NvBufSurfaceAllocate(&new_surf, 1, &allocParams);
         TEST_ERROR(ret < 0, "Failed to create buffers");
 
+        new_surf->numFilled = 1;
+        
         output_surfaces.push_back(new_surf);
 
         struct v4l2_buffer v4l2_buf;

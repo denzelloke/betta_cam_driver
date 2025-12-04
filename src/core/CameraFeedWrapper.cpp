@@ -281,6 +281,9 @@ NvBufSurface *CameraFeedWrapper::initialiseDmaBuffer(const int32_t img_width, co
         raiseFatal("Failed to create NvBufSurface of size: %dx%d!", img_width, img_height);
     }
 
+    // ADD THIS LINE:
+    new_surf->numFilled = 1;
+
     // Explicitly zero out the buffer
     // FIX: Map ALL planes (-1) instead of just plane 0
     if (NvBufSurfaceMap(new_surf, 0, -1, NVBUF_MAP_READ_WRITE) == 0) {
