@@ -80,7 +80,7 @@ H264Encoder::H264Encoder(int32_t width, int32_t height, int32_t bitrate, int32_t
     int ret = ctx->enc->setCapturePlaneFormat(V4L2_PIX_FMT_H264, ctx->width, ctx->height, ctx->packets_buf_size);
     TEST_ERROR(ret < 0, "Could not set output plane format");
 
-    ret = ctx->enc->setOutputPlaneFormat(V4L2_PIX_FMT_YUV420M, ctx->width, ctx->height);
+    ret = ctx->enc->setOutputPlaneFormat(V4L2_PIX_FMT_NV12M, ctx->width, ctx->height);
     TEST_ERROR(ret < 0, "Could not set output plane format");
 
     ret = ctx->enc->setBitrate(bitrate);
@@ -187,6 +187,7 @@ bool H264Encoder::encodeFrame(Msg_ImageH264Feed &msg, NvBufSurface *src_surf) {
     return true;
 }
 
+// REPLACE the entire nvmpi_encoder_put_frame function with this NV12-compatible version:
 bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
     struct v4l2_buffer v4l2_buf;
     struct v4l2_plane planes[MAX_PLANES];
@@ -194,66 +195,46 @@ bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
 
     memset(&v4l2_buf, 0, sizeof(v4l2_buf));
     memset(planes, 0, sizeof(planes));
-
     v4l2_buf.m.planes = planes;
 
-    if (ctx->enc->isInError()) {
-        return false;
-    }
+    if (ctx->enc->isInError()) return false;
 
     if (ctx->in_frame_buffer_index < ctx->enc->output_plane.getNumBuffers()) {
-        nvBuffer       = ctx->enc->output_plane.getNthBuffer(ctx->in_frame_buffer_index);
+        nvBuffer = ctx->enc->output_plane.getNthBuffer(ctx->in_frame_buffer_index);
         v4l2_buf.index = ctx->in_frame_buffer_index;
-
     } else if (ctx->enc->output_plane.dqBuffer(v4l2_buf, &nvBuffer, NULL, -1) < 0) {
         return false;
     }
 
-    // --- FIX 1: Correct Timestamp Calculation ---
-    // Old logic: (index * 1000000) % (fps * 1000000) -> Invalid if index >= fps
     uint64_t timestamp_us = (uint64_t)ctx->in_frame_buffer_index * 1000000 / ctx->fps_n;
     v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
-    v4l2_buf.timestamp.tv_sec  = timestamp_us / 1000000;
+    v4l2_buf.timestamp.tv_sec = timestamp_us / 1000000;
     v4l2_buf.timestamp.tv_usec = timestamp_us % 1000000;
-
     ctx->in_frame_buffer_index++;
 
-    // Fill plane sizes
-    const int32_t plane_y_sizes  = ctx->width * ctx->height;
-    const int32_t plane_uv_sizes = plane_y_sizes / 4;
+    // NV12 Size Calculation (2 Planes)
+    const int32_t plane_y_bytes = ctx->width * ctx->height;
+    const int32_t plane_uv_bytes = ctx->width * (ctx->height / 2);
 
-    nvBuffer->planes[0].bytesused = plane_y_sizes;
-    nvBuffer->planes[1].bytesused = plane_uv_sizes;
-    nvBuffer->planes[2].bytesused = plane_uv_sizes;
+    nvBuffer->planes[0].bytesused = plane_y_bytes;
+    nvBuffer->planes[1].bytesused = plane_uv_bytes;
 
-    // --- FIX 2: Copy bytesused to v4l2_buf ---
-    // The driver checks this structure, NOT just the NvBuffer.
-    // Without this loop, frames are 0-byte and dropped by the encoder.
     for (int i = 0; i < MAX_PLANES; i++) {
         v4l2_buf.m.planes[i].bytesused = nvBuffer->planes[i].bytesused;
     }
 
-    // Map source surface (from Decoder or Camera)
-    if (NvBufSurfaceMap(src_surf, 0, -1, NVBUF_MAP_READ) != 0) {
-        printf("Failed to map source surface in H264Encoder\n");
-        return false;
-    }
+    if (NvBufSurfaceMap(src_surf, 0, -1, NVBUF_MAP_READ) != 0) return false;
     NvBufSurfaceSyncForCpu(src_surf, 0, -1);
 
-    // Copy data (CPU Copy)
-    for (int channel_idx = 0; channel_idx < 3; channel_idx++) {
-        const int32_t step_divisor = (channel_idx == 0) ? 1 : 2;
-        const int32_t plane_h      = ctx->height / step_divisor;
-        const int32_t plane_w      = ctx->width / step_divisor;
+    // COPY LOGIC FOR NV12 (2 PLANES ONLY)
+    for (int i = 0; i < 2; i++) {
+        const int32_t plane_h = (i == 0) ? ctx->height : (ctx->height / 2);
+        const int32_t plane_w = ctx->width;
+        uint32_t src_pitch = src_surf->surfaceList[0].planeParams.pitch[i];
+        uint32_t dst_pitch = nvBuffer->planes[i].fmt.stride;
+        uint8_t *src = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[i];
+        uint8_t *dst = (uint8_t *)nvBuffer->planes[i].data;
 
-        // Handle pitch differences
-        uint32_t src_pitch = src_surf->surfaceList[0].planeParams.pitch[channel_idx];
-        uint32_t dst_pitch = nvBuffer->planes[channel_idx].fmt.stride;
-
-        uint8_t *src = (uint8_t *)src_surf->surfaceList[0].mappedAddr.addr[channel_idx];
-        uint8_t *dst = (uint8_t *)nvBuffer->planes[channel_idx].data;
-
-        // Copy row by row if pitches differ, otherwise single memcpy
         if (src_pitch == dst_pitch && src_pitch == (uint32_t)plane_w) {
              memcpy(dst, src, plane_w * plane_h);
         } else {
@@ -262,15 +243,11 @@ bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *src_surf) {
              }
         }
     }
-
     NvBufSurfaceUnMap(src_surf, 0, -1);
 
-    // Queue the buffer for encoding
-    int32_t ret = ctx->enc->output_plane.qBuffer(v4l2_buf, NULL);
-    TEST_ERROR(ret < 0, "Error while queueing buffer at output plane");
-
-    return true;
+    return (ctx->enc->output_plane.qBuffer(v4l2_buf, NULL) >= 0);
 }
+
 
 bool H264Encoder::nvmpi_encoder_get_packet(Msg_ImageH264Feed &msg) {
 

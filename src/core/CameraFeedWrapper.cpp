@@ -160,7 +160,7 @@ std::string CameraFeedWrapper::isExistsCalibration(std::string &calibration_file
 
 bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
 
-    ROS_INFO("spinH264FeedOnce");
+    ROS_INFO("spinH264FeedOnce.");
     std::lock_guard<std::recursive_mutex> lock(calibration_mutex);
     if (rectifyImageYUVPtr) {
         ROS_TIME feed_timestamp;
@@ -273,7 +273,7 @@ NvBufSurface *CameraFeedWrapper::initialiseDmaBuffer(const int32_t img_width, co
     input_params.params.width               = img_width;
     input_params.params.height              = img_height;
     input_params.params.layout              = NVBUF_LAYOUT_PITCH;
-    input_params.params.colorFormat         = NVBUF_COLOR_FORMAT_YUV420;
+    input_params.params.colorFormat         = NVBUF_COLOR_FORMAT_NV12;
     input_params.params.memType             = NVBUF_MEM_SURFACE_ARRAY;
 
     NvBufSurface *new_surf = nullptr;

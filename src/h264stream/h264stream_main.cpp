@@ -56,7 +56,7 @@ void H264StreamDecoder::source_h264_cb(Msg_ImageH264Feed_ConstPtr msg) {
 }
 
 void H264StreamDecoder::source_h264_config_cb(Msg_FullDepthCamConfig_ConstPtr msg) {
-    mode = msg->conf_mode_outdoor;
+    mode      = msg->conf_mode_outdoor;
     serial_id = msg->camera_serial_num;
     if (mode == 0) {
         calibrationMode = "calibration_seaWater.yaml";
