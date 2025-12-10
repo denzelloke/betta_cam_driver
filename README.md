@@ -156,4 +156,3 @@ apt-get install libcurl4-openssl-dev
 ```
 
 ---
-# betta_cam_driver

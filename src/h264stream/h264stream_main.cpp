@@ -26,7 +26,7 @@ void H264StreamDecoder::capture_decode_publish_fn() {
 
     while (should_continue_capture) {
         rate_limiter.sleep();
-        if (h264_decoder.decoder_get_frame(CameraFeedWrapper::dma_buf_2K)) {
+        if (h264_decoder.decoder_get_frame(CameraFeedWrapper::surf_2K_)) {
             captureAndPublishOnce(nullptr);
         }
     }

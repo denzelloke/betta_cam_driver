@@ -6,7 +6,7 @@
 #include <bx_msgs/RateLimiter.hpp>
 #include <bx_msgs/RosBindings.hpp>
 
-// MIGRATION: Use New API
+#include <NvBuffer.h>
 #include <nvbufsurface.h>
 #include <nvbufsurftransform.h>
 
@@ -14,8 +14,7 @@
 
 #include <queue>
 
-// FIX: Set to 10 to prevent pipeline starvation/deadlocks
-#define ENC_MAX_BUFFERS 10
+#define ENC_MAX_BUFFERS 2
 
 struct H264EncoderNvmpictx {
     NvVideoEncoder *enc;
@@ -44,13 +43,12 @@ public:
     explicit H264Encoder(int32_t width, int32_t height, int32_t bitrate, int32_t fps, bool use_all_intra = false);
     ~H264Encoder();
 
-    // MIGRATION: Takes NvBufSurface* instead of fd
-    bool encodeFrame(Msg_ImageH264Feed &msg, NvBufSurface *src_surf);
+    bool encodeFrame(Msg_ImageH264Feed &msg, NvBufSurface *surf);
 
 private:
     H264EncoderNvmpictx *ctx;
 
-    bool nvmpi_encoder_put_frame(NvBufSurface *src_surf);
+    bool nvmpi_encoder_put_frame(NvBufSurface *surf);
     bool nvmpi_encoder_get_packet(Msg_ImageH264Feed &msg);
 };
 

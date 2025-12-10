@@ -46,7 +46,7 @@ set(PROJECT_LIBRARIES
     cudart
     nvinfer
     nvparsers
-    #nveglstream_camconsumer
+    # nveglstream_camconsumer idk why i needed to delete this but ima just do it for now...
     nvargus_socketclient
     ${LIBSSH_LIBRARIES}
     ssh
