@@ -160,8 +160,6 @@ std::string CameraFeedWrapper::isExistsCalibration(std::string &calibration_file
 }
 
 bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
-    ROS_INFO("spinH264FeedOnce!");
-    printf("\nspinH264FeedOnce");
     std::lock_guard<std::recursive_mutex> lock(calibration_mutex);
     if (rectifyImageYUVPtr) {
         ROS_TIME feed_timestamp;

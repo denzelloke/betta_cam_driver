@@ -101,7 +101,10 @@ bool H264Decoder::decoder_get_frame(NvBufSurface *out_surf) {
     NvBufSurfTransform_Error error =
             NvBufSurfTransform(intermediate_surf_vec_[picture_index], out_surf, &transform_params_);
 
-    TEST_ERROR(error != NvBufSurfTransformError_Success, "Transform failed");
+    if (error != NvBufSurfTransformError_Success) {
+        LOG_ERROR("NvBufSurfTransform FAILED IN DECODER_GET_FRAME\npicture index = %d\n", picture_index);
+        return false;
+    }
 
     return true;
 }
@@ -132,7 +135,7 @@ bool H264Decoder::decoder_get_frame(NvBufSurface *out_surf) {
  * prepares for decoder_get_frame which will do the actual transformation of the intermediate buffers
  */
 void H264Decoder::respondToResolutionEvent() {
-
+    printf("RESPOND TO RESOLUTION EVENT CALLED!\n");
     struct v4l2_format v4l2Format;
     int32_t ret = dec_->capture_plane.getFormat(v4l2Format);
     TEST_ERROR(ret < 0, "Error: Could not get format from decoder capture plane");
@@ -348,7 +351,7 @@ void H264Decoder::nvmpi_create_decoder() {
     // V4L2_MEMORY_USERPTR -> application allocates memory buffers (using new / malloc) and pass the ptrs to the encoder
     // V4L2_MEMORY_MMAP -> encoder driver allocates the buffers itself within hardware.
     // you js ask for a pointer to map it to copy ur data into
-    ret = dec_->output_plane.setupPlane(V4L2_MEMORY_MMAP, 10, false, true);
+    ret = dec_->output_plane.setupPlane(V4L2_MEMORY_MMAP, 10, true, false);
     // ret = dec_->output_plane.setupPlane(V4L2_MEMORY_USERPTR, 10, false, true);
     TEST_ERROR(ret < 0, "Error while setting up output plane");
 

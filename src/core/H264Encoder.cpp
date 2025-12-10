@@ -131,9 +131,9 @@ H264Encoder::H264Encoder(int32_t width, int32_t height, int32_t bitrate, int32_t
     // V4L2_MEMORY_USERPTR -> application allocates memory buffers (using new / malloc) and pass the ptrs to the encoder
     // V4L2_MEMORY_MMAP -> encoder driver allocates the buffers itself within hardware.
     // you js ask for a pointer to map it to copy ur data into
-    ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_MMAP, ENC_MAX_BUFFERS, false, true);
+    ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_MMAP, ENC_MAX_BUFFERS, true, false);
     // ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_USERPTR, ENC_MAX_BUFFERS, false, true);
-    
+
     TEST_ERROR(ret < 0, "Could not setup output plane");
 
     ret = ctx->enc->capture_plane.setupPlane(V4L2_MEMORY_MMAP, ENC_MAX_BUFFERS, true, false);
@@ -179,10 +179,12 @@ H264Encoder::~H264Encoder() {
 
 bool H264Encoder::encodeFrame(Msg_ImageH264Feed &msg, NvBufSurface *surf) {
     if (!nvmpi_encoder_put_frame(surf)) {
-        return false;
+        printf("\n\n111111111111111111111111111\n\n");
+        return true;
     }
 
     if (!nvmpi_encoder_get_packet(msg)) {
+        printf("\n\n2222222222222222222222222222\n\n");
         return false;
     }
 
