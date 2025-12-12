@@ -175,22 +175,22 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
     const bool is_fourth_frame = ((h264_msg.seq_id & 0x03) == 0);
 
     // If using the full-depth feed, process rectification.
-    {
-        std::lock_guard<std::recursive_mutex> lock(calibration_mutex);
-        if (rectifyImageYUVPtr) {
-            nvBuffer2CvMat(image_yuv_2K, surf_2K_);
+    // {
+    //     std::lock_guard<std::recursive_mutex> lock(calibration_mutex);
+    //     if (rectifyImageYUVPtr) {
+    //         nvBuffer2CvMat(image_yuv_2K, surf_2K_);
 
-            // Perform rectification
-            if (!rectifyImageYUVPtr->rectifyImage(rectified_yuv_2K, image_yuv_2K)) {
-                ROS_ERROR("Image rectification failed");
-                SET_NODE_STATUS_CRITICAL_ERROR();
-                return false;
-            }
+    //         // Perform rectification
+    //         if (!rectifyImageYUVPtr->rectifyImage(rectified_yuv_2K, image_yuv_2K)) {
+    //             ROS_ERROR("Image rectification failed");
+    //             SET_NODE_STATUS_CRITICAL_ERROR();
+    //             return false;
+    //         }
 
-            // Convert back to NvBuffer
-            CvMat2NvBuffer(rectified_yuv_2K, surf_2K_);
-        }
-    }
+    //         // Convert back to NvBuffer
+    //         CvMat2NvBuffer(rectified_yuv_2K, surf_2K_);
+    //     }
+    // }
 
     // Handles the JPEG encoding for the RAW feed
     if (res_ptr != nullptr) {
@@ -201,7 +201,7 @@ bool CameraFeedWrapper::spinH264FeedOnce(Srv_CamGetSnapshot_Response *res_ptr) {
 
     // Publish the Raw HD H264 feed
     resizeFrame(surf_2K_, surf_HD_, IMAGE_WIDTH_2K, IMAGE_HEIGHT_2K, IMAGE_WIDTH_720, IMAGE_HEIGHT_720);
-    if (h264_raw_hd_encoder->encodeFrame(h264_msg, surf_HD_)) {  // migrated from dma_buf_2K
+    if (h264_raw_hd_encoder->encodeFrame(h264_msg, surf_HD_)) {
         PUBLISH_ROS(pub_raw_hd_h264, h264_msg);
         SET_NODE_STATUS_OK();
 
@@ -268,7 +268,7 @@ NvBufSurface *CameraFeedWrapper::initialiseDmaBuffer(const int32_t img_width, co
     input_params.params.width       = img_width;
     input_params.params.height      = img_height;
     input_params.params.layout      = NVBUF_LAYOUT_PITCH;
-    input_params.params.colorFormat = NVBUF_COLOR_FORMAT_YUV420;
+    input_params.params.colorFormat = NVBUF_COLOR_FORMAT_NV12;  // YUV420->NV12:  NVBUF_COLOR_FORMAT_YUV420;
     input_params.params.memType     = NVBUF_MEM_SURFACE_ARRAY;
     input_params.memtag             = NvBufSurfaceTag_NONE;
 
@@ -337,7 +337,7 @@ bool CameraFeedWrapper::nvBuffer2CvMat(cv::Mat &out_yuv_image, NvBufSurface *sur
     size_t offset                 = 0;
     static const int plane_divs[] = {1, 2, 2};  // Y, U, V divisors
 
-    for (int channel_idx = 0; channel_idx < 3; channel_idx++) {
+    for (int channel_idx = 0; channel_idx < 2; channel_idx++) {  // YUV420->NV12: change 3 channel_idx to 2 channel_idx
 
         // map dma memory into surf-> surfaceList->mappedAddr->addr
         if (NvBufSurfaceMap(surf, 0, channel_idx, NVBUF_MAP_READ) != 0) {
@@ -352,8 +352,14 @@ bool CameraFeedWrapper::nvBuffer2CvMat(cv::Mat &out_yuv_image, NvBufSurface *sur
             return false;
         }
 
-        const int32_t plane_h     = img_h / plane_divs[channel_idx];
-        const int32_t plane_w     = img_w / plane_divs[channel_idx];
+        // YUV420->NV12: change plane size calculation
+        // NV12 plane size calculation
+        const int32_t plane_h = (channel_idx == 0) ? img_h : (img_h / 2);
+        const int32_t plane_w = (channel_idx == 0) ? img_w : img_w;
+
+        // YUV420 plane size calculation
+        // const int32_t plane_h     = img_h / plane_divs[channel_idx];
+        // const int32_t plane_w     = img_w / plane_divs[channel_idx];
         const int32_t plane_pitch = surf_params.planeParams.pitch[channel_idx];
 
         uint8_t *src = static_cast<uint8_t *>(src_data);
@@ -393,7 +399,7 @@ bool CameraFeedWrapper::CvMat2NvBuffer(const cv::Mat &yuv_image, NvBufSurface *s
     size_t src_offset             = 0;
     static const int plane_divs[] = {1, 2, 2};  // Y, U, V divisors
 
-    for (int channel_idx = 0; channel_idx < 3; channel_idx++) {
+    for (int channel_idx = 0; channel_idx < 2; channel_idx++) {  // YUV420->NV12: change 3 channel_idx to 2 channel_idx
 
         // map dma memory into surf-> surfaceList->mappedAddr->addr
         if (NvBufSurfaceMap(surf, 0, channel_idx, NVBUF_MAP_WRITE) != 0) {
@@ -403,10 +409,15 @@ bool CameraFeedWrapper::CvMat2NvBuffer(const cv::Mat &yuv_image, NvBufSurface *s
         // extract mapped memory and cast to dst
         void *dst_data = surf_params.mappedAddr.addr[channel_idx];
 
-        const int32_t plane_width  = img_width / plane_divs[channel_idx];
-        const int32_t plane_height = img_height / plane_divs[channel_idx];
-        const int32_t plane_pitch  = surf_params.planeParams.pitch[channel_idx];
-        uint8_t *dst               = static_cast<uint8_t *>(dst_data);
+        // YUV420->NV12: change plane size calculation
+        // NV12 plane size calculation
+        const int32_t plane_width  = (channel_idx == 0) ? img_width : img_width;
+        const int32_t plane_height = (channel_idx == 0) ? img_height : (img_height / 2);
+        // YUV420 plane size calculation
+        // const int32_t plane_width  = img_width / plane_divs[channel_idx];
+        // const int32_t plane_height = img_height / plane_divs[channel_idx];
+        const int32_t plane_pitch = surf_params.planeParams.pitch[channel_idx];
+        uint8_t *dst              = static_cast<uint8_t *>(dst_data);
 
         for (int row = 0; row < plane_height; row++) {
             memcpy(dst + row * plane_pitch, yuv_data + src_offset, plane_width);
@@ -460,7 +471,13 @@ bool CameraFeedWrapper::resizeFrame(
     transform_params.transform_filter = NvBufSurfTransformInter_Algo4;
 
     NvBufSurfTransform_Error error = NvBufSurfTransform(srcSurf, dstSurf, &transform_params);
-    return (error == NvBufSurfTransformError_Success);
+        if (error != NvBufSurfTransformError_Success) {
+        return false;
+    }
+
+    dstSurf->numFilled = 1;
+
+    return true;
 }
 
 
@@ -468,7 +485,10 @@ void CameraFeedWrapper::NvBuffer2Jpeg(NvBufSurface *surf, std::vector<uint8_t> &
 
     if (!jpeg_encoder || !surf) {
         nvBuffer2CvMat(jpeg_yuv_image, surf);
-        cv::cvtColor(jpeg_yuv_image, jpeg_bgr_image, cv::COLOR_YUV2BGR_I420);
+        cv::cvtColor(
+                jpeg_yuv_image,
+                jpeg_bgr_image,
+                cv::COLOR_YUV2BGR_NV12);  // YUV420->NV12: change from COLOR_YUV2BGR_I420
         jpeg_buffer.clear();
         cv::imencode(".jpeg", jpeg_bgr_image, jpeg_buffer);
         return;

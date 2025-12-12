@@ -80,7 +80,10 @@ H264Encoder::H264Encoder(int32_t width, int32_t height, int32_t bitrate, int32_t
     int ret = ctx->enc->setCapturePlaneFormat(V4L2_PIX_FMT_H264, ctx->width, ctx->height, ctx->packets_buf_size);
     TEST_ERROR(ret < 0, "Could not set output plane format");
 
-    ret = ctx->enc->setOutputPlaneFormat(V4L2_PIX_FMT_YUV420M, ctx->width, ctx->height);
+    ret = ctx->enc->setOutputPlaneFormat(
+            V4L2_PIX_FMT_NV12M,
+            ctx->width,
+            ctx->height);  // YUV420->NV12: V4L2_PIX_FMT_YUV420M
     TEST_ERROR(ret < 0, "Could not set output plane format");
 
     ret = ctx->enc->setBitrate(bitrate);
@@ -131,8 +134,8 @@ H264Encoder::H264Encoder(int32_t width, int32_t height, int32_t bitrate, int32_t
     // V4L2_MEMORY_USERPTR -> application allocates memory buffers (using new / malloc) and pass the ptrs to the encoder
     // V4L2_MEMORY_MMAP -> encoder driver allocates the buffers itself within hardware.
     // you js ask for a pointer to map it to copy ur data into
-    ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_MMAP, ENC_MAX_BUFFERS, true, false);
-    // ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_USERPTR, ENC_MAX_BUFFERS, false, true);
+    // ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_MMAP, ENC_MAX_BUFFERS, true, false);
+    ret = ctx->enc->output_plane.setupPlane(V4L2_MEMORY_USERPTR, ENC_MAX_BUFFERS, false, true);
 
     TEST_ERROR(ret < 0, "Could not setup output plane");
 
@@ -180,7 +183,7 @@ H264Encoder::~H264Encoder() {
 bool H264Encoder::encodeFrame(Msg_ImageH264Feed &msg, NvBufSurface *surf) {
     if (!nvmpi_encoder_put_frame(surf)) {
         printf("\n\n111111111111111111111111111\n\n");
-        return true;
+        // return true;
     }
 
     if (!nvmpi_encoder_get_packet(msg)) {
@@ -222,22 +225,27 @@ bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *surf) {
     v4l2_buf.timestamp.tv_usec = (ctx->in_frame_buffer_index * 1'000'000) % (ctx->fps_n * 1'000'000);
     v4l2_buf.timestamp.tv_sec  = ctx->in_frame_buffer_index / ctx->fps_n;
 
-    // Fill plane sizes
-    const int32_t plane_y_sizes  = ctx->width * ctx->height;
-    const int32_t plane_uv_sizes = plane_y_sizes / 4;
+    // Fill plane sizes for NV12
+    // Plane 0 (Y): 1 byte per pixel
+    // Plane 1 (UV): 2 bytes per 2 pixels (interleaved) -> effectively 1 byte per pixel-pair width-wise,
+    //               but full width in bytes. Total size is Y_Size / 2.
+    const int32_t plane_y_size  = ctx->width * ctx->height;
+    const int32_t plane_uv_size = plane_y_size / 2;
 
-    // Fill NvBuffer
-    nvBuffer->planes[0].bytesused = plane_y_sizes;
-    nvBuffer->planes[1].bytesused = plane_uv_sizes;
-    nvBuffer->planes[2].bytesused = plane_uv_sizes;
+    // Fill NvBuffer (NV12 has only 2 planes)
+    nvBuffer->planes[0].bytesused = plane_y_size;
+    nvBuffer->planes[1].bytesused = plane_uv_size;
 
     NvBufSurfaceParams &surf_params = surf->surfaceList[0];
 
-    for (int channel_idx = 0; channel_idx < 3; channel_idx++) {
+    // Loop for 2 planes (Y and UV)
+    for (int channel_idx = 0; channel_idx < 2; channel_idx++) {
+
         // map dma memory into surf-> surfaceList->mappedAddr->addr
         if (NvBufSurfaceMap(surf, 0, channel_idx, NVBUF_MAP_READ) != 0) {
             return false;
         }
+
         // extract mapped memory and cast to src
         void *src_data = surf_params.mappedAddr.addr[channel_idx];
 
@@ -246,16 +254,49 @@ bool H264Encoder::nvmpi_encoder_put_frame(NvBufSurface *surf) {
             return false;
         }
 
-        const int32_t step_divisor = (channel_idx == 0) ? 1 : 2;
-        const int32_t plane_h      = ctx->height / step_divisor;
-        const int32_t plane_w      = ctx->width / step_divisor;
-        const int32_t plane_pitch  = surf_params.planeParams.pitch[channel_idx];
+        // NV12 Plane Dimensions
+        // Plane 0 (Y):  Height = H,     Width (bytes) = W
+        // Plane 1 (UV): Height = H / 2, Width (bytes) = W  <-- Important: Width is NOT divided by 2
+        const int32_t plane_h = (channel_idx == 0) ? ctx->height : ctx->height / 2;
+        const int32_t plane_w = ctx->width;
+
+        const int32_t plane_pitch = surf_params.planeParams.pitch[channel_idx];
 
         uint8_t *src = static_cast<uint8_t *>(src_data);
         uint8_t *dst = static_cast<uint8_t *>(nvBuffer->planes[channel_idx].data);
 
+        // Safety check for NULL buffer mapping
+        if (!dst) {
+            printf("Error: Encoder input buffer plane %d is NULL\n", channel_idx);
+            NvBufSurfaceUnMap(surf, 0, channel_idx);
+            return false;
+        }
+
         for (int32_t row = 0; row < plane_h; row++) {
             memcpy(dst + row * plane_w, src + row * plane_pitch, plane_w);
+        }
+
+
+        // TURN ON IN CASE OF GREEN-NESS
+        if (channel_idx == 0) {  // Y plane
+            printf("[ENCODER] Y plane: ");
+            printf("First 16 Y: ");
+            for (int i = 0; i < 16; i++) {
+                printf("%d ", src[i]);
+            }
+            printf("\n");
+        } else if (channel_idx == 1) {  // UV plane
+            printf("[ENCODER] UV plane: ");
+            printf("First 16 UV: ");
+            for (int i = 0; i < 16; i++) {
+                printf("%d ", src[i]);
+            }
+            printf(" (sum of first 100: ");
+            int sum = 0;
+            for (int i = 0; i < 100; i++) {
+                sum += src[i];
+            }
+            printf("%d, avg: %d)\n\n", sum, sum / 100);
         }
 
         // unmap memory

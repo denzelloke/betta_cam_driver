@@ -24,7 +24,7 @@ bool H264Decoder::decoder_put_packet(const Msg_ImageH264Feed_ConstPtr &msg) {
     if (!has_first_frame_) {
         printf("Waiting for first I frame\n");
 
-        if (is_keyframe) {
+        if (is_keyframe) {  // QUESTION: why is this not (!is_keyframe)
             return false;
         }
 
@@ -98,13 +98,60 @@ bool H264Decoder::decoder_get_frame(NvBufSurface *out_surf) {
     const int picture_index = frame_pools_.front();
     frame_pools_.pop();
 
-    NvBufSurfTransform_Error error =
-            NvBufSurfTransform(intermediate_surf_vec_[picture_index], out_surf, &transform_params_);
+    NvBufSurface *src_surf = intermediate_surf_vec_[picture_index];
+    src_surf->numFilled    = 1;  // cheeky change
+    // NvBufSurfaceSyncForCpu(out_surf, 0, -1);  // cheeky change
+
+    // -- debugging diagnostics --
+    static bool printed_once = false;
+    if (!printed_once) {
+        printf("\n=== TRANSFORM DIAGNOSTIC INFO ===\n");
+        printf("Source Buffer [index=%d]:\n", picture_index);
+        printf("  Size: %dx%d\n", src_surf->surfaceList[0].width, src_surf->surfaceList[0].height);
+        printf("  ColorFormat: %d\n", src_surf->surfaceList[0].colorFormat);
+        printf("  Layout: %d (0=PITCH, 1=BLOCK_LINEAR)\n", src_surf->surfaceList[0].layout);
+        printf("  MemType: %d\n", src_surf->memType);
+
+        printf("Destination Buffer:\n");
+        printf("  Size: %dx%d\n", out_surf->surfaceList[0].width, out_surf->surfaceList[0].height);
+        printf("  ColorFormat: %d\n", out_surf->surfaceList[0].colorFormat);
+        printf("  Layout: %d (0=PITCH, 1=BLOCK_LINEAR)\n", out_surf->surfaceList[0].layout);
+        printf("  MemType: %d\n", out_surf->memType);
+
+        printf("Transform Params:\n");
+        printf("  Flag: 0x%x\n", transform_params_.transform_flag);
+        printf("  Src rect: (%d,%d) %dx%d\n",
+               transform_params_.src_rect->left,
+               transform_params_.src_rect->top,
+               transform_params_.src_rect->width,
+               transform_params_.src_rect->height);
+        printf("  Dst rect: (%d,%d) %dx%d\n",
+               transform_params_.dst_rect->left,
+               transform_params_.dst_rect->top,
+               transform_params_.dst_rect->width,
+               transform_params_.dst_rect->height);
+        printf("=================================\n\n");
+    }
+    // -- debugging diagnostics end --
+
+    // DEBUGGING NOTES:
+    // the old code used NvBufferTransform(fd_src, fd_dest, ...) which operated directly on file descriptors, not on
+    // NvBufSurface structures. It didn't need metadata because it worked at a lower level.
+    // The new API (NvBufSurfTransform) expects properly structured NvBufSurface objects with correct metadata.
+
+    NvBufSurfTransform_Error error = NvBufSurfTransform(src_surf, out_surf, &transform_params_);
 
     if (error != NvBufSurfTransformError_Success) {
         LOG_ERROR("NvBufSurfTransform FAILED IN DECODER_GET_FRAME\npicture index = %d\n", picture_index);
+        if (!printed_once) {
+            LOG_ERROR("NvBufSurfTransform FAILED with error code: %d\n", error);
+            LOG_ERROR("Error codes: 0=Success, -1=Invalid Params, -2=Not Supported, -3=Mem Error\n");
+            printed_once = true;
+        }
         return false;
     }
+
+    out_surf->numFilled = 1;  // Mark destination as filled
 
     return true;
 }
@@ -158,7 +205,8 @@ void H264Decoder::respondToResolutionEvent() {
     intermediate_surf_vec_.clear();
 
     ret = dec_->setCapturePlaneFormat(
-            v4l2Format.fmt.pix_mp.pixelformat,
+            V4L2_PIX_FMT_NV12M,
+            // v4l2Format.fmt.pix_mp.pixelformat,  // tells decoder to output as NV12 (DOES NOT SUPPORT YUV420)
             v4l2Format.fmt.pix_mp.width,
             v4l2Format.fmt.pix_mp.height);
     TEST_ERROR(ret < 0, "Error in setting decoder capture plane format");
@@ -179,25 +227,29 @@ void H264Decoder::respondToResolutionEvent() {
     allocParams.params.memType = NVBUF_MEM_SURFACE_ARRAY;
     allocParams.memtag         = NvBufSurfaceTag_VIDEO_DEC;
 
-    const bool isQuantDefault = (v4l2Format.fmt.pix_mp.quantization == V4L2_QUANTIZATION_DEFAULT);
-    switch (v4l2Format.fmt.pix_mp.colorspace) {
-    case V4L2_COLORSPACE_SMPTE170M:
-        allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12 : NVBUF_COLOR_FORMAT_NV12_ER;
-        break;
+    // const bool isQuantDefault = (v4l2Format.fmt.pix_mp.quantization == V4L2_QUANTIZATION_DEFAULT);
+    // switch (v4l2Format.fmt.pix_mp.colorspace) {
+    // case V4L2_COLORSPACE_SMPTE170M:
+    //     allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12 : NVBUF_COLOR_FORMAT_NV12_ER;
+    //     break;
 
-    case V4L2_COLORSPACE_REC709:
-        allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12_709 : NVBUF_COLOR_FORMAT_NV12_709_ER;
-        break;
+    // case V4L2_COLORSPACE_REC709:
+    //     allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12_709 :
+    //     NVBUF_COLOR_FORMAT_NV12_709_ER; break;
 
-    case V4L2_COLORSPACE_BT2020:
-        //"Decoder colorspace ITU-R BT.2020";
-        allocParams.params.colorFormat = NVBUF_COLOR_FORMAT_NV12_2020;
-        break;
+    // case V4L2_COLORSPACE_BT2020:
+    //     //"Decoder colorspace ITU-R BT.2020";
+    //     allocParams.params.colorFormat = NVBUF_COLOR_FORMAT_NV12_2020;
+    //     break;
 
-    default:
-        allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12 : NVBUF_COLOR_FORMAT_NV12_ER;
-        break;
-    }
+    // default:
+    //     allocParams.params.colorFormat = isQuantDefault ? NVBUF_COLOR_FORMAT_NV12 : NVBUF_COLOR_FORMAT_NV12_ER;
+    //     break;
+    // }
+
+    allocParams.params.colorFormat = NVBUF_COLOR_FORMAT_NV12;
+
+    printf("allocParams.params.colorFormat: %d\n", allocParams.params.colorFormat);
 
     const int32_t numberCaptureBuffers = 5 + minimumDecoderCaptureBuffers;
     dec_->capture_plane.reqbufs(V4L2_MEMORY_DMABUF, numberCaptureBuffers);
@@ -253,7 +305,8 @@ void H264Decoder::respondToResolutionEvent() {
     transform_params_.dst_rect = &dst_rect_params_;
 
     // set transform_params flags
-    transform_params_.transform_flag   = NVBUFSURF_TRANSFORM_FILTER;
+    transform_params_.transform_flag =
+            NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_SRC | NVBUFSURF_TRANSFORM_CROP_DST;
     transform_params_.transform_flip   = NvBufSurfTransform_None;
     transform_params_.transform_filter = NvBufSurfTransformInter_Algo3;
 }
@@ -351,8 +404,8 @@ void H264Decoder::nvmpi_create_decoder() {
     // V4L2_MEMORY_USERPTR -> application allocates memory buffers (using new / malloc) and pass the ptrs to the encoder
     // V4L2_MEMORY_MMAP -> encoder driver allocates the buffers itself within hardware.
     // you js ask for a pointer to map it to copy ur data into
-    ret = dec_->output_plane.setupPlane(V4L2_MEMORY_MMAP, 10, true, false);
-    // ret = dec_->output_plane.setupPlane(V4L2_MEMORY_USERPTR, 10, false, true);
+    // ret = dec_->output_plane.setupPlane(V4L2_MEMORY_MMAP, 10, true, false);
+    ret = dec_->output_plane.setupPlane(V4L2_MEMORY_USERPTR, 10, false, true);
     TEST_ERROR(ret < 0, "Error while setting up output plane");
 
     dec_->output_plane.setStreamStatus(true);
